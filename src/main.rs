@@ -1,7 +1,7 @@
 //! Pingpong - Main Entry Point
 //! 
-//! Phase 3: WebSocket streaming + Concurrent Order Execution
-//! Real-time orderbook via WebSocket + tokio::join! for leg execution.
+//! Phase 3.5: Hot Switchover Manager + In-Memory Director
+//! Primary + Backup WebSockets with auto-failover
 
 use std::env;
 use std::sync::Arc;
@@ -14,11 +14,13 @@ mod api;
 mod strategy;
 mod trading;
 mod websocket;
+mod hot_switchover;
 
 use api::PolyClient;
 use strategy::{PingpongStrategy, StrategyEvent};
 use trading::{TradingEngine, TradingConfig, start_trading_loop, ArbitrageSignal};
-use websocket::{WSClient, OrderBookUpdate};
+use websocket::OrderBookUpdate;
+use hot_switchover::{run_hot_switchover_manager, AppState};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -35,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
         .expect("Failed to set tracing subscriber");
     
     info!("═══════════════════════════════════════════════════════════════");
-    info!("   PINGPONG v0.3.0 - WebSocket + Concurrent Execution");
+    info!("   PINGPONG v0.3.5 - Hot Switchover Manager");
     info!("═══════════════════════════════════════════════════════════════");
     
     // Parse command line args
@@ -51,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
     }
     
     if use_websocket {
-        info!("📡 Using WebSocket for real-time orderbook streaming");
+        info!("📡 Using Hot Switchover WebSocket (primary + backup)");
     } else {
         info!("🌐 Using REST API (slower polling mode)");
     }
@@ -95,11 +97,11 @@ async fn main() -> anyhow::Result<()> {
     let _trading_handle = tokio::spawn(start_trading_loop(engine, trading_rx));
     
     if use_websocket {
-        // Phase 3: WebSocket streaming mode
-        run_websocket_mode(api.clone(), strategy_tx, trading_tx).await?;
+        // Phase 3.5: Hot Switchover WebSocket mode
+        run_websocket_mode(api.clone(), strategy_tx).await?;
     } else {
         // Phase 2: REST polling mode
-        run_rest_mode(api.clone(), strategy_tx, trading_tx).await?;
+        run_rest_mode(api.clone(), strategy_tx).await?;
     }
     
     Ok(())
@@ -109,7 +111,6 @@ async fn main() -> anyhow::Result<()> {
 async fn run_rest_mode(
     api: Arc<PolyClient>,
     strategy_tx: mpsc::UnboundedSender<StrategyEvent>,
-    trading_tx: mpsc::UnboundedSender<ArbitrageSignal>,
 ) -> anyhow::Result<()> {
     use orderbook::OrderBookTracker;
     
@@ -120,7 +121,7 @@ async fn run_rest_mode(
         tracker,
         api.clone(),
         strategy_tx,
-    ).with_trading_channel(trading_tx);
+    );
     info!("✅ Strategy engine initialized");
     
     // Check API health
@@ -140,13 +141,12 @@ async fn run_rest_mode(
     Ok(())
 }
 
-/// WebSocket streaming mode (Phase 3)
+/// Hot Switchover WebSocket mode (Phase 3.5)
 async fn run_websocket_mode(
     api: Arc<PolyClient>,
     strategy_tx: mpsc::UnboundedSender<StrategyEvent>,
-    _trading_tx: mpsc::UnboundedSender<ArbitrageSignal>,
 ) -> anyhow::Result<()> {
-    info!("🚀 Starting WebSocket streaming mode...");
+    info!("🚀 Starting Hot Switchover WebSocket mode...");
     
     // First, get initial market list via REST
     let markets = api.get_markets().await?;
@@ -154,43 +154,31 @@ async fn run_websocket_mode(
     
     // Collect all YES/NO token IDs
     let mut tokens: Vec<String> = Vec::new();
-    let mut condition_ids: Vec<String> = Vec::new();
     
     for market in &markets {
         tokens.push(market.yes_token_id());
         tokens.push(market.no_token_id());
-        condition_ids.push(market.condition_id.clone());
     }
     
-    info!("🔌 Connecting to Polymarket WebSocket...");
+    // Create shared application state
+    let state = Arc::new(AppState::new());
     
-    // Create WebSocket client
-    let ws_client = Arc::new(WSClient::new());
-    
-    // Create channel for updates
+    // Create channel for director to send updates
     let (update_tx, mut update_rx) = mpsc::unbounded_channel::<OrderBookUpdate>();
     
-    // Spawn WebSocket streaming task
+    // Run Hot Switchover Manager (spawns primary + backup WS)
     let tokens_for_stream = tokens.clone();
-    let ws_client_clone = ws_client.clone();
+    tokio::spawn(run_hot_switchover_manager(tokens_for_stream, state.clone(), update_tx));
     
-    let ws_handle = tokio::spawn(async move {
-        if let Err(e) = ws_client_clone.stream(tokens_for_stream, move |update| {
-            let _ = update_tx.send(update);
-        }).await {
-            tracing::error!("WebSocket error: {}", e);
-        }
-    });
-    
-    info!("✅ WebSocket connected and streaming");
     info!("");
     info!("═══════════════════════════════════════════════════════════════");
     info!("   🎯 PINGPONG REAL-TIME ARBITRAGE DETECTION");
+    info!("   🛡️  Hot Switchover: Primary + Backup Active");
     info!("═══════════════════════════════════════════════════════════════");
-    info!("   Monitoring {} markets in real-time", condition_ids.len());
+    info!("   Monitoring {} markets in real-time", markets.len());
     info!("");
     
-    // Process WebSocket updates
+    // Process updates from the Trading Director
     let mut scan_count = 0u64;
     let target_hedge = 1.05; // Combined cost threshold
     
@@ -199,29 +187,26 @@ async fn run_websocket_mode(
             Some(update) => {
                 scan_count += 1;
                 
-                // Check for arbitrage on this specific market
-                if let Some((yes_ask, no_ask)) = ws_client.get_best_prices(&update.condition_id) {
-                    let combined = yes_ask + no_ask;
-                    
-                    // Log periodically
-                    if scan_count % 100 == 0 {
+                // Simple arbitrage check (director already filtered noise)
+                let combined = update.price * 2.0; // Rough estimate
+                
+                // Log periodically
+                if scan_count % 100 == 0 {
+                    info!(
+                        "📋 {} | Price: ${:.4} | Combined: ${:.4}",
+                        &update.condition_id[..8.min(update.condition_id.len())],
+                        update.price,
+                        combined
+                    );
+                }
+                
+                // Check for arbitrage opportunity
+                if combined < target_hedge && combined > 0.0 {
+                    let profit = 1.0 - combined - (combined * 0.02);
+                    if profit > 0.01 {
                         info!(
-                            "📋 {} | YES: ${:.4} | NO: ${:.4} | COMBINED: ${:.4}",
+                            "🎯 ARBITRAGE OPPORTUNITY! {} | Combined: ${:.4} | Profit: ${:.4}/share",
                             &update.condition_id[..8.min(update.condition_id.len())],
-                            yes_ask,
-                            no_ask,
-                            combined
-                        );
-                    }
-                    
-                    // Check for arbitrage opportunity
-                    if combined < target_hedge {
-                        let profit = 1.0 - combined - (combined * 0.02);
-                        info!(
-                            "🎯 ARBITRAGE OPPORTUNITY! {} | YES: ${:.4} + NO: ${:.4} = ${:.4} | Profit: ${:.4}/share",
-                            &update.condition_id[..8.min(update.condition_id.len())],
-                            yes_ask,
-                            no_ask,
                             combined,
                             profit
                         );
@@ -229,8 +214,8 @@ async fn run_websocket_mode(
                         // Send event
                         let _ = strategy_tx.send(StrategyEvent::ArbitrageDetected {
                             market: update.condition_id.clone(),
-                            yes_ask,
-                            no_ask,
+                            yes_ask: update.price,
+                            no_ask: update.price,
                             combined,
                             profit,
                         });
@@ -238,13 +223,11 @@ async fn run_websocket_mode(
                 }
             }
             None => {
-                warn!("WebSocket update channel closed");
+                warn!("Update channel closed");
                 break;
             }
         }
     }
-    
-    ws_handle.abort();
     
     Ok(())
 }
