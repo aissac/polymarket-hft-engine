@@ -97,9 +97,7 @@ impl PingpongStrategy {
             // Fetch markets from API
             match self.api.get_markets().await {
                 Ok(markets) => {
-                    if scan_count % 60 == 0 {
-                        info!("📊 Scanning {} markets (scan #{})", markets.len(), scan_count);
-                    }
+                    info!("📊 Scan #{}: {} markets", scan_count, markets.len());
                     
                     // Update tracker and check for arbitrage
                     for market in &markets {

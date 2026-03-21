@@ -1,25 +1,11 @@
 //! Polymarket REST API Client
 //! 
-//! Fetches markets, orderbooks, and prices from Polymarket CLOB API.
+//! Uses polymarket-client-sdk for proper compression handling.
 
 use anyhow::{Result, anyhow};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::time::Duration;
-use tracing::{debug, warn};
-
-/// Polymarket API base URL
-const API_BASE: &str = "https://clob.polymarket.com";
-
-/// HTTP client with sensible defaults
-pub fn create_client() -> Client {
-    Client::builder()
-        .timeout(Duration::from_secs(10))
-        .user_agent("pingpong-bot/0.1")
-        .build()
-        .expect("Failed to create HTTP client")
-}
+use tracing::debug;
 
 /// Token price data from simplified-markets
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,135 +88,97 @@ impl SimplifiedMarket {
     }
 }
 
-/// API response wrapper
-#[derive(Debug, Deserialize)]
-pub struct MarketsResponse {
-    pub data: Vec<SimplifiedMarket>,
-}
-
-/// Polymarket REST API Client
-pub struct PolyClient {
-    client: Client,
-    base_url: String,
-}
+/// Polymarket REST API Client (unauthenticated, read-only)
+pub struct PolyClient;
 
 impl PolyClient {
     pub fn new() -> Self {
-        Self {
-            client: create_client(),
-            base_url: API_BASE.to_string(),
-        }
+        Self
     }
     
-    /// Get simplified markets (faster, less data)
+    /// Get simplified markets via SDK (handles compression)
     pub async fn get_markets(&self) -> Result<Vec<SimplifiedMarket>> {
-        let url = format!("{}/sampling-simplified-markets?limit=100", self.base_url);
+        use polymarket_client_sdk::clob::Client as ClobClient;
+        use polymarket_client_sdk::clob::Config as ClobConfig;
         
-        debug!("Fetching markets from: {}", url);
+        let client = ClobClient::new("https://clob.polymarket.com", ClobConfig::default())?;
         
-        let response = self.client.get(&url)
-            .send()
-            .await?;
+        debug!("Fetching markets via SDK...");
         
-        if !response.status().is_success() {
-            return Err(anyhow!("API returned status: {}", response.status()));
-        }
+        // Use SDK's simplified_markets endpoint
+        let result = client.simplified_markets(None).await?;
         
-        let markets_resp: MarketsResponse = response.json().await?;
-        
-        // Filter: only active, not closed, has both YES and NO prices
-        let markets: Vec<SimplifiedMarket> = markets_resp.data
+        // Convert to our SimplifiedMarket format
+        let simplified: Vec<SimplifiedMarket> = result.data
             .into_iter()
-            .filter(|m| {
-                m.active && 
-                !m.closed && 
-                m.yes_price().is_some() && 
-                m.no_price().is_some()
+            .filter_map(|m| {
+                // Extract YES/NO tokens
+                let mut yes_price = None;
+                let mut no_price = None;
+                let mut yes_token_id = None;
+                let mut no_token_id = None;
+                
+                for token in m.tokens {
+                    let price: Option<f64> = token.price.to_string().parse().ok();
+                    
+                    if token.outcome.to_lowercase() == "yes" {
+                        yes_price = price;
+                        yes_token_id = Some(token.token_id);
+                    } else if token.outcome.to_lowercase() == "no" {
+                        no_price = price;
+                        no_token_id = Some(token.token_id);
+                    }
+                }
+                
+                match (yes_price, no_price, yes_token_id, no_token_id) {
+                    (Some(yp), Some(np), Some(ytid), Some(ntid)) => {
+                        Some(SimplifiedMarket {
+                            condition_id: m.condition_id,
+                            tokens: vec![
+                                TokenData {
+                                    token_id: ytid,
+                                    outcome: "Yes".to_string(),
+                                    price_raw: serde_json::Value::Number(
+                                        serde_json::Number::from_f64(yp).unwrap_or(serde_json::Number::from(0))
+                                    ),
+                                },
+                                TokenData {
+                                    token_id: ntid,
+                                    outcome: "No".to_string(),
+                                    price_raw: serde_json::Value::Number(
+                                        serde_json::Number::from_f64(np).unwrap_or(serde_json::Number::from(0))
+                                    ),
+                                },
+                            ],
+                            active: m.active,
+                            closed: m.closed,
+                        })
+                    }
+                    _ => None,
+                }
             })
+            .take(20) // Limit to 20 markets
             .collect();
         
-        Ok(markets)
-    }
-    
-    /// Get orderbook for a specific condition ID
-    pub async fn get_orderbook(&self, condition_id: &str) -> Result<(Vec<OrderBookLevel>, Vec<OrderBookLevel>)> {
-        let url = format!("{}/orderbook/{}", self.base_url, condition_id);
-        
-        #[derive(Deserialize)]
-        struct OrderBookResponse {
-            bids: Vec<PriceLevel>,
-            asks: Vec<PriceLevel>,
-        }
-        
-        #[derive(Deserialize)]
-        struct PriceLevel {
-            price: Value,
-            size: Value,
-        }
-        
-        let response = self.client.get(&url)
-            .send()
-            .await?;
-        
-        if !response.status().is_success() {
-            return Err(anyhow!("Orderbook API returned: {}", response.status()));
-        }
-        
-        let ob: OrderBookResponse = response.json().await?;
-        
-        let bids: Vec<OrderBookLevel> = ob.bids
-            .into_iter()
-            .filter_map(|p| {
-                let price = match p.price {
-                    Value::Number(n) => n.as_f64(),
-                    Value::String(s) => s.parse().ok(),
-                    _ => None,
-                }?;
-                let size = match p.size {
-                    Value::Number(n) => n.as_f64(),
-                    Value::String(s) => s.parse().ok(),
-                    _ => None,
-                }?;
-                Some(OrderBookLevel { price, size })
-            })
-            .collect();
-        
-        let asks: Vec<OrderBookLevel> = ob.asks
-            .into_iter()
-            .filter_map(|p| {
-                let price = match p.price {
-                    Value::Number(n) => n.as_f64(),
-                    Value::String(s) => s.parse().ok(),
-                    _ => None,
-                }?;
-                let size = match p.size {
-                    Value::Number(n) => n.as_f64(),
-                    Value::String(s) => s.parse().ok(),
-                    _ => None,
-                }?;
-                Some(OrderBookLevel { price, size })
-            })
-            .collect();
-        
-        Ok((bids, asks))
+        Ok(simplified)
     }
     
     /// Check API health
     pub async fn health_check(&self) -> Result<bool> {
-        let url = format!("{}/sampling-markets?limit=1", self.base_url);
+        use polymarket_client_sdk::clob::Client as ClobClient;
+        use polymarket_client_sdk::clob::Config as ClobConfig;
         
-        match self.client.get(&url).send().await {
-            Ok(resp) => Ok(resp.status().is_success()),
-            Err(_) => Ok(false),
+        let client = ClobClient::new("https://clob.polymarket.com", ClobConfig::default())?;
+        
+        // Use None for cursor to get first page
+        match client.simplified_markets(None).await {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                debug!("Health check error: {}", e);
+                Ok(false)
+            }
         }
     }
-}
-
-/// Orderbook level
-#[derive(Debug, Clone)]
-pub struct OrderBookLevel {
-    pub price: f64,
-    pub size: f64,
 }
 
 impl Default for PolyClient {
