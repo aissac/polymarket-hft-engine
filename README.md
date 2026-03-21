@@ -16,10 +16,10 @@ Gabagool is an arbitrage strategy that exploits pricing inefficiencies between Y
 gabagool-bot/
 ├── src/
 │   ├── main.rs        # Entry point
-│   ├── lib.rs         # Core types
-│   ├── orderbook.rs   # Order book tracking
-│   ├── websocket.rs   # Polymarket WebSocket client
-│   └── strategy.rs   # Trading strategy engine
+│   ├── lib.rs         # Core types & constants
+│   ├── api.rs         # Polymarket REST API client
+│   ├── orderbook.rs   # Thread-safe price tracker
+│   └── strategy.rs    # Arbitrage detection engine
 ├── Cargo.toml
 └── README.md
 ```
@@ -28,10 +28,10 @@ gabagool-bot/
 
 | Phase | Status | Description |
 |-------|--------|-------------|
-| 1 | ✅ Complete | WebSocket + Orderbook (read-only) |
-| 2 | ⏳ Pending | EIP-712 signing + REST execution |
-| 3 | ⏳ Pending | Strategy + leg risk fallback |
-| 4 | ⏳ Pending | AWS deployment |
+| 1 | ✅ Complete | REST API + Orderbook tracking (read-only) |
+| 2 | ⏳ Pending | EIP-712 signing + order execution |
+| 3 | ⏳ Pending | Leg risk fallback + circuit breakers |
+| 4 | ⏳ Pending | AWS deployment (EC2 + Docker) |
 
 ## Building
 
