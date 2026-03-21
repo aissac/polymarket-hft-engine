@@ -3,13 +3,11 @@ name = "gabagool-bot"
 version = "0.1.0"
 edition = "2021"
 
+[workspace]
+
 [dependencies]
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
-
-# WebSocket
-tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
-futures-util = "0.3"
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json"] }
@@ -24,7 +22,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Error handling
 anyhow = "1.0"
-thiserror = "1.0"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }

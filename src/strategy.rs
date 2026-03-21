@@ -1,29 +1,28 @@
 //! Gabagool Strategy Engine
 //! 
 //! Phase 1: Read-only strategy that monitors for arbitrage opportunities.
-//! No actual trading - just proving the data pipeline.
 
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
-use tracing::{info, warn, debug};
+use tracing::{info, debug, warn};
 
 use crate::orderbook::OrderBookTracker;
+use crate::api::{PolyClient, SimplifiedMarket};
 
 const TARGET_HEDGE_SUM: f64 = 0.95;
 
 /// Strategy state
 #[derive(Debug, Clone)]
 pub enum StrategyState {
+    Initializing,
     Scanning,
     OpportunityFound,
-    Executing,
-    InPosition,
     Error,
 }
 
-/// Strategy event
+/// Strategy event for logging/analytics
 #[derive(Debug, Clone)]
 pub enum StrategyEvent {
     ArbitrageDetected {
@@ -34,21 +33,27 @@ pub enum StrategyEvent {
         profit: f64,
     },
     StateChanged(StrategyState),
-    Error(String),
+    ApiError(String),
 }
 
 /// Main strategy engine
 pub struct GabagoolStrategy {
     state: StrategyState,
     tracker: Arc<OrderBookTracker>,
+    api: Arc<PolyClient>,
     events: mpsc::UnboundedSender<StrategyEvent>,
 }
 
 impl GabagoolStrategy {
-    pub fn new(tracker: Arc<OrderBookTracker>, events: mpsc::UnboundedSender<StrategyEvent>) -> Self {
+    pub fn new(
+        tracker: Arc<OrderBookTracker>, 
+        api: Arc<PolyClient>,
+        events: mpsc::UnboundedSender<StrategyEvent>,
+    ) -> Self {
         Self {
-            state: StrategyState::Scanning,
+            state: StrategyState::Initializing,
             tracker,
+            api,
             events,
         }
     }
@@ -58,38 +63,85 @@ impl GabagoolStrategy {
         info!("🚀 Gabagool Strategy starting (PHASE 1: Read-Only Mode)");
         info!("📊 Target: {} for arbitrage detection", TARGET_HEDGE_SUM);
         
+        // Check API health first
+        if !self.check_api_health().await {
+            warn!("⚠️ API health check failed, continuing anyway...");
+        }
+        
+        self.state = StrategyState::Scanning;
+        let mut scan_count = 0u64;
+        
         loop {
-            // Check all markets for arbitrage
-            let opportunites = self.tracker.find_arbitrages(TARGET_HEDGE_SUM);
+            scan_count += 1;
             
-            if !opportunites.is_empty() {
-                for (market, details) in opportunites {
-                    info!(
-                        "🎯 ARBITRAGE OPPORTUNITY: {} | YES: ${:.4} + NO: ${:.4} = ${:.4} | Profit: ${:.4}/share",
-                        market,
-                        details.yes_ask,
-                        details.no_ask,
-                        details.combined_cost,
-                        details.profit_per_share
-                    );
+            // Fetch markets from API
+            match self.api.get_markets().await {
+                Ok(markets) => {
+                    if scan_count % 60 == 0 {
+                        info!("📊 Scanning {} markets (scan #{})", markets.len(), scan_count);
+                    }
                     
-                    // In Phase 1, just log it - don't trade
-                    let _ = self.events.send(StrategyEvent::ArbitrageDetected {
-                        market: market.clone(),
-                        yes_ask: details.yes_ask,
-                        no_ask: details.no_ask,
-                        combined: details.combined_cost,
-                        profit: details.profit_per_share,
-                    });
+                    // Update tracker and check for arbitrage
+                    for market in &markets {
+                        let yes_price = market.yes_price();
+                        let no_price = market.no_price();
+                        
+                        self.tracker.update(
+                            &market.condition_id,
+                            yes_price,
+                            no_price,
+                        );
+                        
+                        // Check if this market has arbitrage
+                        if market.has_arbitrage(TARGET_HEDGE_SUM) {
+                            let combined = market.combined_cost().unwrap_or(1.0);
+                            let profit = 1.0 - combined - (combined * 0.02); // After 2% fee
+                            
+                            info!(
+                                "🎯 ARBITRAGE OPPORTUNITY: {} | YES: ${:.4} + NO: ${:.4} = ${:.4} | Profit: ${:.4}/share",
+                                market.condition_id,
+                                yes_price.unwrap_or(0.0),
+                                no_price.unwrap_or(0.0),
+                                combined,
+                                profit
+                            );
+                            
+                            let _ = self.events.send(StrategyEvent::ArbitrageDetected {
+                                market: market.condition_id.clone(),
+                                yes_ask: yes_price.unwrap_or(0.0),
+                                no_ask: no_price.unwrap_or(0.0),
+                                combined,
+                                profit,
+                            });
+                        }
+                    }
                 }
-                
-                self.state = StrategyState::OpportunityFound;
-            } else {
-                self.state = StrategyState::Scanning;
+                Err(e) => {
+                    warn!("API error: {}", e);
+                    let _ = self.events.send(StrategyEvent::ApiError(e.to_string()));
+                }
             }
             
-            // Check every 100ms
-            sleep(Duration::from_millis(100)).await;
+            // Poll every second
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+    
+    /// Check if API is healthy
+    async fn check_api_health(&self) -> bool {
+        match self.api.health_check().await {
+            Ok(true) => {
+                info!("✅ Polymarket API is healthy");
+                true
+            }
+            Ok(false) => {
+                warn!("⚠️ Polymarket API returned unhealthy");
+                false
+            }
+            Err(e) => {
+                warn!("⚠️ Could not reach Polymarket API: {}", e);
+                false
+            }
         }
     }
     
@@ -99,24 +151,23 @@ impl GabagoolStrategy {
     }
 }
 
-/// Async logger for strategy events (sends to CloudWatch via stdout)
+/// Async logger for strategy events
 pub async fn start_event_logger(mut rx: mpsc::UnboundedReceiver<StrategyEvent>) {
     info!("📝 Strategy event logger started");
     
     while let Some(event) = rx.recv().await {
         match event {
             StrategyEvent::ArbitrageDetected { market, yes_ask, no_ask, combined, profit } => {
-                // Log to stdout - CloudWatch agent will pick this up
                 println!(
                     "ARB_DETECTED {} YES={:.4} NO={:.4} COMBINED={:.4} PROFIT={:.4}",
                     market, yes_ask, no_ask, combined, profit
                 );
             }
             StrategyEvent::StateChanged(state) => {
-                println!("STATE_CHANGE {:?}", state);
+                debug!("STATE_CHANGE {:?}", state);
             }
-            StrategyEvent::Error(msg) => {
-                eprintln!("STRATEGY_ERROR {}", msg);
+            StrategyEvent::ApiError(msg) => {
+                eprintln!("API_ERROR {}", msg);
             }
         }
     }
