@@ -13,7 +13,7 @@ use crate::orderbook::OrderBookTracker;
 use crate::api::{PolyClient, SimplifiedMarket};
 use crate::trading::ArbitrageSignal;
 
-const TARGET_HEDGE_SUM: f64 = 0.95;
+const TARGET_HEDGE_SUM: f64 = 1.05;
 
 /// Strategy state
 #[derive(Debug, Clone)]
@@ -103,6 +103,18 @@ impl PingpongStrategy {
                     for market in &markets {
                         let yes_price = market.yes_price();
                         let no_price = market.no_price();
+                        let combined = yes_price.zip(no_price).map(|(y, n)| y + n);
+                        
+                        // Log market prices
+                        if scan_count % 10 == 0 || combined.is_some_and(|c| c < 1.05) {
+                            info!(
+                                "📋 {} | YES: ${:.4} | NO: ${:.4} | COMBINED: ${:.4}",
+                                &market.condition_id[..8.min(market.condition_id.len())],
+                                yes_price.unwrap_or(0.0),
+                                no_price.unwrap_or(0.0),
+                                combined.unwrap_or(0.0)
+                            );
+                        }
                         
                         self.tracker.update(
                             &market.condition_id,
@@ -110,8 +122,8 @@ impl PingpongStrategy {
                             no_price,
                         );
                         
-                        // Check if this market has arbitrage
-                        if market.has_arbitrage(TARGET_HEDGE_SUM) {
+                        // Check if this market has arbitrage (combined < 1.05)
+                        if combined.is_some_and(|c| c < TARGET_HEDGE_SUM) {
                             let combined = market.combined_cost().unwrap_or(1.0);
                             let profit = 1.0 - combined - (combined * 0.02); // After 2% fee
                             

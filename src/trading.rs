@@ -11,7 +11,7 @@ use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
 use polymarket_client_sdk::clob::types::{Amount, OrderType, Side};
 use polymarket_client_sdk::types::Decimal;
 use tokio::sync::mpsc;
-use tracing::{info, error};
+use tracing::{info, error, warn};
 
 use crate::api::SimplifiedMarket;
 
@@ -85,7 +85,7 @@ impl TradingEngine {
         self.signer.is_some()
     }
 
-    /// Execute arbitrage trade
+    /// Execute arbitrage trade with CONCURRENT legs (Phase 3)
     pub async fn execute_arbitrage(&self, market: &SimplifiedMarket) -> Result<OrderResult> {
         if !self.is_ready() {
             anyhow::bail!("Trading engine not initialized");
@@ -115,20 +115,73 @@ impl TradingEngine {
         );
         
         if self.config.dry_run {
-            info!("🔒 DRY RUN - No real orders placed");
-            return Ok(OrderResult {
-                market_id: market.condition_id.clone(),
-                yes_order_id: Some("dry_run_yes".to_string()),
-                no_order_id: Some("dry_run_no".to_string()),
-                yes_filled: true,
-                no_filled: true,
-                profit_estimate: profit,
-            });
+            info!("🔒 DRY RUN - Simulating concurrent orders...");
+            
+            // Simulate concurrent execution
+            let (yes_res, no_res) = tokio::join!(
+                async { 
+                    info!("  → Placing YES order (simulated)...");
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                    Ok::<String, anyhow::Error>("dry_run_yes".to_string())
+                },
+                async { 
+                    info!("  → Placing NO order (simulated)...");
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                    Ok::<String, anyhow::Error>("dry_run_no".to_string())
+                }
+            );
+            
+            match (yes_res, no_res) {
+                (Ok(yes_id), Ok(no_id)) => {
+                    info!("✅ Both legs filled! YES={} NO={}", yes_id, no_id);
+                    Ok(OrderResult {
+                        market_id: market.condition_id.clone(),
+                        yes_order_id: Some(yes_id),
+                        no_order_id: Some(no_id),
+                        yes_filled: true,
+                        no_filled: true,
+                        profit_estimate: profit,
+                    })
+                }
+                (Ok(yes_id), Err(e)) => {
+                    warn!("⚠️ LEG RISK: YES filled but NO failed: {}", e);
+                    Ok(OrderResult {
+                        market_id: market.condition_id.clone(),
+                        yes_order_id: Some(yes_id),
+                        no_order_id: None,
+                        yes_filled: true,
+                        no_filled: false,
+                        profit_estimate: profit,
+                    })
+                }
+                (Err(e), Ok(no_id)) => {
+                    warn!("⚠️ LEG RISK: NO filled but YES failed: {}", e);
+                    Ok(OrderResult {
+                        market_id: market.condition_id.clone(),
+                        yes_order_id: None,
+                        no_order_id: Some(no_id),
+                        yes_filled: false,
+                        no_filled: true,
+                        profit_estimate: profit,
+                    })
+                }
+                (Err(e1), Err(e2)) => {
+                    error!("❌ Both legs failed: YES={}, NO={}", e1, e2);
+                    Ok(OrderResult {
+                        market_id: market.condition_id.clone(),
+                        yes_order_id: None,
+                        no_order_id: None,
+                        yes_filled: false,
+                        no_filled: false,
+                        profit_estimate: profit,
+                    })
+                }
+            }
+        } else {
+            // LIVE MODE - use actual SDK calls
+            // TODO: Implement real order placement with EIP-712 signing
+            anyhow::bail!("Live trading - implement EIP-712 signing");
         }
-        
-        // Real order placement would go here in Phase 2.5
-        // Requires proper authenticated client management
-        anyhow::bail!("Live trading - use dry_run mode");
     }
 }
 

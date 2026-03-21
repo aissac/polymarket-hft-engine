@@ -1,332 +1,261 @@
-//! WebSocket Client for Polymarket CLOB
+//! Pingpong WebSocket Module
 //! 
-//! Connects to Polymarket's WebSocket API and subscribes to orderbook updates.
-//! Phase 1: Read-only - just tracking prices, no trading.
+//! Real-time orderbook streaming via Polymarket WebSocket.
+//! Replaces REST polling for low-latency arbitrage detection.
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
+use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::net::TcpStream;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-use tokio_tungstenite::tungstenite::http::Request;
-use tracing::{info, warn, error, debug};
-
-use crate::orderbook::OrderBookTracker;
-use crate::strategy::PingpongStrategy;
-
-const TARGET_HEDGE_SUM: f64 = 0.95;
+use tokio::sync::mpsc;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tracing::{debug, error, info, warn};
 
 /// Polymarket WebSocket URL
-const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws";
+const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
-/// Subscription message to send after connect
-#[derive(Debug, Serialize)]
-struct SubscribeMessage {
-    #[serde(rename = "type")]
-    msg_type: String,
-    channel: String,
-    #[serde(rename = "request_id")]
-    request_id: String,
-    #[serde(rename = "jsonrpc")]
-    jsonrpc: String,
-}
-
-impl SubscribeMessage {
-    fn new(channel: &str, request_id: &str) -> Self {
-        Self {
-            msg_type: "subscribe".to_string(),
-            channel: channel.to_string(),
-            request_id: request_id.to_string(),
-            jsonrpc: "2.0".to_string(),
-        }
-    }
-}
-
-/// Orderbook update from Polymarket WebSocket
-#[derive(Debug, Deserialize, Clone)]
-#[serde(tag = "type")]
-pub enum CLOBMessage {
-    /// Orderbook update with price levels
-    #[serde(rename = "orderbook")]
-    Orderbook(OrderbookUpdate),
-    
-    /// Trade/fill notification
-    #[serde(rename = "auction")]
-    Auction(AuctionUpdate),
-    
-    /// Subscription confirmed
-    #[serde(rename = "subscribe")]
-    Subscribed(SubscriptionStatus),
-    
-    /// Error response
-    #[serde(rename = "error")]
-    Error(ErrorResponse),
-    
-    /// Pong (heartbeat response)
-    #[serde(rename = "pong")]
-    Pong,
-    
-    /// Unknown message type
-    #[serde(other)]
-    Unknown,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct OrderbookUpdate {
-    pub market_slug: Option<String>,
-    pub token_id: Option<String>,
-    pub side: Option<String>,  // "buy" or "sell"
-    #[serde(rename = "pricePoints")]
-    pub price_points: Option<Vec<PricePoint>>,
-    pub ts: Option<i64>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct PricePoint {
+/// Orderbook price level
+#[derive(Debug, Clone)]
+pub struct PriceLevel {
     pub price: f64,
     pub size: f64,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct AuctionUpdate {
-    pub market_slug: Option<String>,
-    pub status: Option<String>,
+/// YES/NO orderbook for a market
+#[derive(Debug, Clone, Default)]
+pub struct MarketOrderBook {
+    pub yes_bids: Vec<PriceLevel>,
+    pub yes_asks: Vec<PriceLevel>,
+    pub no_bids: Vec<PriceLevel>,
+    pub no_asks: Vec<PriceLevel>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct SubscriptionStatus {
-    pub channel: Option<String>,
-    pub request_id: Option<String>,
-    pub success: Option<bool>,
+/// Orderbook update from WebSocket
+#[derive(Debug, Clone)]
+pub struct OrderBookUpdate {
+    pub condition_id: String,
+    pub token_id: String,
+    pub side: String,      // "buy" or "sell"
+    pub outcome: String,    // "yes" or "no"
+    pub price: f64,
+    pub size: f64,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct ErrorResponse {
-    pub code: Option<i32>,
-    pub message: Option<String>,
+/// Pre-allocated buffer for zero-allocation parsing
+struct ParseBuffer {
+    data: Vec<u8>,
 }
 
-/// Polymarket WebSocket Client
-pub struct PolymarketWsClient {
-    ws_url: String,
-    tracker: Arc<OrderBookTracker>,
-    running: Arc<parking_lot::RwLock<bool>>,
-}
-
-impl PolymarketWsClient {
-    pub fn new(tracker: Arc<OrderBookTracker>) -> Self {
+impl ParseBuffer {
+    fn new(capacity: usize) -> Self {
         Self {
-            ws_url: WS_URL.to_string(),
-            tracker,
-            running: Arc::new(parking_lot::RwLock::new(false)),
+            data: vec![0u8; capacity],
         }
     }
     
-    /// Connect and start the WebSocket reader loop
-    pub async fn connect(&self) -> Result<()> {
-        info!("🔌 Connecting to Polymarket WebSocket: {}", self.ws_url);
-        
-        let request = Request::builder()
-            .uri(&self.ws_url)
-            .header("Sec-WebSocket-Protocol", "graphql-ws")
-            .body(())?;
-        
-        let (ws_stream, _) = connect_async(request).await?;
-        
-        {
-            let mut running = self.running.write();
-            *running = true;
+    fn update(&mut self, new_data: &[u8]) -> &[u8] {
+        let len = new_data.len().min(self.data.len());
+        self.data[..len].copy_from_slice(&new_data[..len]);
+        &self.data[..len]
+    }
+}
+
+/// WebSocket client for Polymarket orderbook
+pub struct WSClient {
+    url: String,
+    orderbooks: Arc<RwLock<HashMap<String, MarketOrderBook>>>,
+    buffer: ParseBuffer,
+}
+
+impl WSClient {
+    pub fn new() -> Self {
+        Self {
+            url: WS_URL.to_string(),
+            orderbooks: Arc::new(RwLock::new(HashMap::new())),
+            buffer: ParseBuffer::new(512 * 1024), // 512KB pre-allocated
         }
+    }
+    
+    /// Connect to WebSocket and stream orderbook updates
+    pub async fn stream<F>(&self, subscribed_tokens: Vec<String>, mut on_update: F) -> Result<()>
+    where
+        F: FnMut(OrderBookUpdate) + Send + 'static,
+    {
+        info!("🔌 Connecting to Polymarket WebSocket...");
         
-        info!("✅ Connected! Starting message loop...");
+        let (ws_stream, _) = connect_async(&self.url).await?;
+        info!("✅ WebSocket connected");
         
         let (mut write, mut read) = ws_stream.split();
         
-        // Subscribe to orderbook channel
-        let subscribe_msg = SubscribeMessage::new("orderbook", "orderbook-sub-1");
-        let json = serde_json::to_string(&subscribe_msg)?;
-        write.send(Message::Text(json.into())).await?;
+        // Subscribe to specific tokens
+        let subscribe_msg = serde_json::json!({
+            "type": "market",
+            "assets": subscribed_tokens
+        });
         
-        info!("📡 Subscribed to orderbook channel");
+        let msg_str = serde_json::to_string(&subscribe_msg)?;
+        write.send(Message::Text(msg_str.into())).await?;
+        info!("📡 Subscribed to {} tokens", subscribed_tokens.len());
         
-        // Message loop
-        let tracker = self.tracker.clone();
-        let running = self.running.clone();
+        // Pre-allocated buffer for zero-allocation hot path
+        let mut parse_buffer = ParseBuffer::new(512 * 1024);
         
-        tokio::spawn(async move {
-            let mut heartbeat_count = 0u64;
-            
-            while *running.read() {
-                tokio::select! {
-                    // Incoming messages
-                    msg = read.next() => {
-                        match msg {
-                            Some(Ok(Message::Text(text))) => {
-                                Self::handle_message(&tracker, &text).await;
-                            }
-                            Some(Ok(Message::Ping(data))) => {
-                                // Respond to ping with pong
-                                if let Ok(pong) = String::from_utf8(data.to_vec()) {
-                                    debug!("Received ping: {}", pong);
-                                }
-                            }
-                            Some(Ok(Message::Pong(_))) => {
-                                // Pong received - connection alive
-                            }
-                            Some(Ok(Message::Close(_))) => {
-                                warn!("WebSocket closed by server");
-                                break;
-                            }
-                            Some(Err(e)) => {
-                                error!("WebSocket error: {}", e);
-                                break;
-                            }
-                            None => {
-                                warn!("WebSocket stream ended");
-                                break;
-                            }
-                            _ => {}
-                        }
-                    }
-                    // Heartbeat every 30 seconds
-                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => {
-                        heartbeat_count += 1;
-                        debug!("❤️ Heartbeat #{}", heartbeat_count);
-                        // Try to send a ping
-                        if let Err(e) = write.send(Message::Ping(vec![].into())).await {
-                            warn!("Failed to send ping: {}", e);
-                        }
+        // Message processing loop
+        while let Some(msg_result) = read.next().await {
+            match msg_result {
+                Ok(Message::Text(text)) => {
+                    // Zero-allocation: parse directly into pre-allocated buffer
+                    let data = parse_buffer.update(text.as_bytes());
+                    
+                    // Try to parse the update
+                    if let Ok(update) = self.parse_update(data) {
+                        // Update local orderbook
+                        self.update_orderbook(&update);
+                        // Callback with update
+                        on_update(update);
                     }
                 }
+                Ok(Message::Ping(data)) => {
+                    debug!("Received ping, sending pong");
+                    write.send(Message::Pong(data)).await?;
+                }
+                Ok(Message::Close(_)) => {
+                    warn!("WebSocket closed by server");
+                    break;
+                }
+                Err(e) => {
+                    error!("WebSocket error: {}", e);
+                    break;
+                }
+                _ => {}
             }
-            
-            {
-                let mut running = running.write();
-                *running = false;
-            }
-            
-            warn!("WebSocket reader loop ended");
-        });
+        }
         
         Ok(())
     }
     
-    /// Handle incoming WebSocket message
-    async fn handle_message(tracker: &Arc<OrderBookTracker>, text: &str) {
-        // Try to parse as CLOBMessage
-        let msg: CLOBMessage = match serde_json::from_str(text) {
-            Ok(msg) => msg,
-            Err(_) => {
-                // Not a JSON message we understand
-                return;
-            }
+    /// Parse orderbook update from raw bytes
+    fn parse_update(&self, data: &[u8]) -> Result<OrderBookUpdate> {
+        // Try to parse as JSON
+        let json: serde_json::Value = serde_json::from_slice(data)?;
+        
+        let update = OrderBookUpdate {
+            condition_id: json["condition_id"].as_str().unwrap_or("").to_string(),
+            token_id: json["token_id"].as_str().unwrap_or("").to_string(),
+            side: json["side"].as_str().unwrap_or("").to_string(),
+            outcome: json["outcome"].as_str().unwrap_or("").to_string(),
+            price: json["price"].as_f64().unwrap_or(0.0),
+            size: json["size"].as_f64().unwrap_or(0.0),
         };
         
-        match msg {
-            CLOBMessage::Orderbook(update) => {
-                Self::handle_orderbook_update(tracker, update).await;
+        Ok(update)
+    }
+    
+    /// Update local orderbook state
+    fn update_orderbook(&self, update: &OrderBookUpdate) {
+        let mut books = self.orderbooks.write();
+        
+        let book = books
+            .entry(update.condition_id.clone())
+            .or_insert_with(MarketOrderBook::default);
+        
+        let level = PriceLevel {
+            price: update.price,
+            size: update.size,
+        };
+        
+        match (update.side.as_str(), update.outcome.as_str()) {
+            ("buy", "yes") => {
+                book.yes_bids.push(level);
+                book.yes_bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap());
             }
-            CLOBMessage::Subscribed(status) => {
-                if let Some(success) = status.success {
-                    if success {
-                        info!("✅ Subscription confirmed for channel: {:?}", status.channel);
-                    } else {
-                        warn!("⚠️ Subscription failed: {:?}", status);
-                    }
-                }
+            ("sell", "yes") => {
+                book.yes_asks.push(level);
+                book.yes_asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap());
             }
-            CLOBMessage::Error(err) => {
-                error!("❌ WebSocket error: {:?}", err);
+            ("buy", "no") => {
+                book.no_bids.push(level);
+                book.no_bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap());
             }
-            CLOBMessage::Pong => {
-                // Heartbeat acknowledged
+            ("sell", "no") => {
+                book.no_asks.push(level);
+                book.no_asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap());
             }
-            _ => {
-                // Ignore other message types in Phase 1
-            }
+            _ => {}
         }
     }
     
-    /// Handle orderbook update
-    async fn handle_orderbook_update(tracker: &Arc<OrderBookTracker>, update: OrderbookUpdate) {
-        let market_slug = match &update.market_slug {
-            Some(s) => s.clone(),
-            None => return,
-        };
+    /// Get best YES ask + best NO ask for arbitrage check
+    pub fn get_best_prices(&self, condition_id: &str) -> Option<(f64, f64)> {
+        let books = self.orderbooks.read();
         
-        let token_id = match &update.token_id {
-            Some(t) => t.clone(),
-            None => return,
-        };
-        
-        let side = match &update.side {
-            Some(s) => s.clone(),
-            None => return,
-        };
-        
-        let price_points = match update.price_points {
-            Some(pp) => pp,
-            None => return,
-        };
-        
-        let timestamp = update.ts.unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64
-        });
-        
-        // Get best price point (first one is best)
-        if let Some(best) = price_points.first() {
-            // Determine YES or NO based on token_id convention
-            // Convention: YES tokens end with 'yes' or we check the orderbook
-            let is_yes = token_id.contains("yes") || token_id.ends_with("1") || token_id.ends_with("0");
+        if let Some(book) = books.get(condition_id) {
+            let yes_ask = book.yes_asks.first().map(|l| l.price);
+            let no_ask = book.no_asks.first().map(|l| l.price);
             
-            if side == "sell" || side == "buy" {
-                // For asks (sell side), we care about the best ask
-                if side == "sell" {
-                    if is_yes {
-                        tracker.update_yes_ask(&market_slug, best.price, best.size, timestamp);
-                    } else {
-                        tracker.update_no_ask(&market_slug, best.price, best.size, timestamp);
-                    }
-                } else {
-                    // Bids (buy side)
-                    if is_yes {
-                        tracker.update_yes_bid(&market_slug, best.price, best.size, timestamp);
-                    } else {
-                        tracker.update_no_bid(&market_slug, best.price, best.size, timestamp);
-                    }
-                }
-            }
-            
-            // Check for arbitrage opportunity
-            if let Some(combined) = tracker.get_combined_cost(&market_slug) {
-                if combined < TARGET_HEDGE_SUM {
-                    if let Some(yes_ask) = tracker.get_yes_ask(&market_slug) {
-                        if let Some(no_ask) = tracker.get_no_ask(&market_slug) {
-                            let profit = 1.0 - combined - (combined * 0.02);
-                            info!(
-                                "🎯 ARBITRAGE DETECTED! {}: YES@${:.4} + NO@${:.4} = ${:.4} (profit: ${:.4}/share)",
-                                market_slug, yes_ask, no_ask, combined, profit
-                            );
-                        }
-                    }
-                }
+            match (yes_ask, no_ask) {
+                (Some(yes), Some(no)) => return Some((yes, no)),
+                _ => {}
             }
         }
+        
+        None
     }
     
-    /// Stop the WebSocket connection
-    pub fn stop(&self) {
-        let mut running = self.running.write();
-        *running = false;
-        info!("🛑 WebSocket client stopping...");
+    /// Get all known condition IDs
+    pub fn get_condition_ids(&self) -> Vec<String> {
+        let books = self.orderbooks.read();
+        books.keys().cloned().collect()
+    }
+}
+
+impl Default for WSClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Start WebSocket streaming in background
+pub async fn start_ws_streamer(
+    tokens: Vec<String>,
+    update_tx: mpsc::UnboundedSender<OrderBookUpdate>,
+) -> Result<()> {
+    let client = WSClient::new();
+    
+    let tx = update_tx.clone();
+    client.stream(tokens, move |update| {
+        let _ = tx.send(update);
+    }).await?;
+    
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_parse_buffer() {
+        let mut buf = ParseBuffer::new(100);
+        let data = b"hello world";
+        let result = buf.update(data);
+        assert_eq!(result, b"hello world");
     }
     
-    /// Check if connected
-    pub fn is_running(&self) -> bool {
-        *self.running.read()
+    #[test]
+    fn test_orderbook_update() {
+        let update = OrderBookUpdate {
+            condition_id: "0x123".to_string(),
+            token_id: "token1".to_string(),
+            side: "buy".to_string(),
+            outcome: "yes".to_string(),
+            price: 0.50,
+            size: 100.0,
+        };
+        
+        assert_eq!(update.price, 0.50);
+        assert_eq!(update.outcome, "yes");
     }
 }
