@@ -103,7 +103,7 @@ impl PolyClient {
     
     /// Get simplified markets (faster, less data)
     pub async fn get_markets(&self) -> Result<Vec<SimplifiedMarket>> {
-        let url = format!("{}/simplified-markets?limit=100", self.base_url);
+        let url = format!("{}/sampling-simplified-markets?limit=100", self.base_url);
         
         debug!("Fetching markets from: {}", url);
         
