@@ -16,7 +16,7 @@ const API_BASE: &str = "https://clob.polymarket.com";
 pub fn create_client() -> Client {
     Client::builder()
         .timeout(Duration::from_secs(10))
-        .user_agent("gabagool-bot/0.1")
+        .user_agent("pingpong-bot/0.1")
         .build()
         .expect("Failed to create HTTP client")
 }

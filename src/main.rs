@@ -1,4 +1,4 @@
-//! Gabagool Bot - Main Entry Point
+//! Pingpong - Main Entry Point
 //! 
 //! Phase 1: REST API + Orderbook tracking (READ-ONLY)
 //! Proves the data pipeline before real trading.
@@ -14,7 +14,7 @@ mod strategy;
 
 use orderbook::OrderBookTracker;
 use api::PolyClient;
-use strategy::{GabagoolStrategy, start_event_logger, StrategyEvent};
+use strategy::{PingpongStrategy, start_event_logger, StrategyEvent};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -55,7 +55,7 @@ async fn main() -> anyhow::Result<()> {
     let _logger_handle = tokio::spawn(start_event_logger(event_rx));
     
     // Start strategy engine
-    let mut strategy = GabagoolStrategy::new(tracker.clone(), api.clone(), event_tx);
+    let mut strategy = PingpongStrategy::new(tracker.clone(), api.clone(), event_tx);
     info!("✅ Strategy engine initialized");
     
     info!("");

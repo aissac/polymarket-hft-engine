@@ -1,4 +1,4 @@
-//! Gabagool Bot - Phase 1: REST API + Orderbook Tracking
+//! Pingpong Bot - Phase 1: REST API + Orderbook Tracking
 //! 
 //! Uses Polymarket REST API to fetch markets and track prices.
 //! Phase 1 is READ-ONLY - no money risked, just proving the data pipeline
@@ -9,7 +9,7 @@ mod strategy;
 
 pub use orderbook::OrderBookTracker;
 pub use api::PolyClient;
-pub use strategy::GabagoolStrategy;
+pub use strategy::PingpongStrategy;
 
 /// Target combined cost - if YES_ask + NO_ask < this, we have arbitrage
 /// 0.95 gives us ~3% profit after 2% Polymarket fee + slippage buffer

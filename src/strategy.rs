@@ -1,4 +1,4 @@
-//! Gabagool Strategy Engine
+//! Pingpong Strategy Engine
 //! 
 //! Phase 1: Read-only strategy that monitors for arbitrage opportunities.
 
@@ -37,14 +37,14 @@ pub enum StrategyEvent {
 }
 
 /// Main strategy engine
-pub struct GabagoolStrategy {
+pub struct PingpongStrategy {
     state: StrategyState,
     tracker: Arc<OrderBookTracker>,
     api: Arc<PolyClient>,
     events: mpsc::UnboundedSender<StrategyEvent>,
 }
 
-impl GabagoolStrategy {
+impl PingpongStrategy {
     pub fn new(
         tracker: Arc<OrderBookTracker>, 
         api: Arc<PolyClient>,
@@ -60,7 +60,7 @@ impl GabagoolStrategy {
     
     /// Main strategy loop (Phase 1: read-only monitoring)
     pub async fn run(&mut self) {
-        info!("🚀 Gabagool Strategy starting (PHASE 1: Read-Only Mode)");
+        info!("🚀 Pingpong Strategy starting (PHASE 1: Read-Only Mode)");
         info!("📊 Target: {} for arbitrage detection", TARGET_HEDGE_SUM);
         
         // Check API health first

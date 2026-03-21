@@ -1,4 +1,4 @@
-//! OrderBook Tracker for Gabagool Strategy
+//! OrderBook Tracker for Pingpong Strategy
 //! 
 //! Thread-safe tracker for YES/NO prices across multiple markets.
 

@@ -1,10 +1,10 @@
-# Gabagool Bot
+# Pingpong
 
 High-frequency arbitrage trading bot for Polymarket prediction markets.
 
 ## Strategy
 
-Gabagool is an arbitrage strategy that exploits pricing inefficiencies between YES and NO tokens:
+Pingpong is an arbitrage strategy that exploits pricing inefficiencies between YES and NO tokens:
 
 - Buy YES and NO tokens when their combined cost < $0.95
 - Guaranteed profit after 2% Polymarket fee
@@ -13,7 +13,7 @@ Gabagool is an arbitrage strategy that exploits pricing inefficiencies between Y
 ## Architecture
 
 ```
-gabagool-bot/
+pingpong/
 ├── src/
 │   ├── main.rs        # Entry point
 │   ├── lib.rs         # Core types & constants
@@ -42,7 +42,7 @@ cargo build --release
 ## Running
 
 ```bash
-./target/release/gabagool-bot
+./target/release/pingpong
 ```
 
 ## License

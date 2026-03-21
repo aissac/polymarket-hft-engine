@@ -13,7 +13,7 @@ use tokio_tungstenite::tungstenite::http::Request;
 use tracing::{info, warn, error, debug};
 
 use crate::orderbook::OrderBookTracker;
-use crate::strategy::GabagoolStrategy;
+use crate::strategy::PingpongStrategy;
 
 const TARGET_HEDGE_SUM: f64 = 0.95;
 
