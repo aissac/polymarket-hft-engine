@@ -15,12 +15,14 @@ mod strategy;
 mod trading;
 mod websocket;
 mod hot_switchover;
+mod pnl;
 
 use api::PolyClient;
 use strategy::{PingpongStrategy, StrategyEvent};
 use trading::{TradingEngine, TradingConfig, start_trading_loop, ArbitrageSignal};
 use websocket::OrderBookUpdate;
 use hot_switchover::{run_hot_switchover_manager, AppState};
+use pnl::{PnlTracker, create_trade_result};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -37,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
         .expect("Failed to set tracing subscriber");
     
     info!("═══════════════════════════════════════════════════════════════");
-    info!("   PINGPONG v0.3.5 - Hot Switchover Manager");
+    info!("   PINGPONG v0.3.6 - PnL Tracking Enabled");
     info!("═══════════════════════════════════════════════════════════════");
     
     // Parse command line args
@@ -64,6 +66,10 @@ async fn main() -> anyhow::Result<()> {
             warn!("POLYMARKET_PRIVATE_KEY not set - running in read-only mode");
             String::new()
         });
+    
+    // Initialize PnL tracker
+    let pnl_tracker = PnlTracker::new(Some("/tmp/pnl_trades.jsonl"));
+    info!("📊 PnL Tracker initialized");
     
     // Initialize API client
     let api = Arc::new(PolyClient::new());
@@ -97,8 +103,8 @@ async fn main() -> anyhow::Result<()> {
     let _trading_handle = tokio::spawn(start_trading_loop(engine, trading_rx));
     
     if use_websocket {
-        // Phase 3.5: Hot Switchover WebSocket mode
-        run_websocket_mode(api.clone(), strategy_tx).await?;
+        // Phase 3.6: Hot Switchover WebSocket mode with PnL tracking
+        run_websocket_mode(api.clone(), strategy_tx, pnl_tracker).await?;
     } else {
         // Phase 2: REST polling mode
         run_rest_mode(api.clone(), strategy_tx).await?;
@@ -141,10 +147,11 @@ async fn run_rest_mode(
     Ok(())
 }
 
-/// Hot Switchover WebSocket mode (Phase 3.5)
+/// Hot Switchover WebSocket mode (Phase 3.6)
 async fn run_websocket_mode(
     api: Arc<PolyClient>,
     strategy_tx: mpsc::UnboundedSender<StrategyEvent>,
+    pnl_tracker: PnlTracker,
 ) -> anyhow::Result<()> {
     info!("🚀 Starting Hot Switchover WebSocket mode...");
     
@@ -211,14 +218,18 @@ async fn run_websocket_mode(
                             profit
                         );
                         
-                        // Send event
-                        let _ = strategy_tx.send(StrategyEvent::ArbitrageDetected {
-                            market: update.condition_id.clone(),
-                            yes_ask: update.price,
-                            no_ask: update.price,
-                            combined,
-                            profit,
-                        });
+                        // Record arbitrage opportunity
+                        pnl_tracker.record_arb_opportunity();
+                        
+                        // Record simulated trade for PnL tracking
+                        let trade = create_trade_result(
+                            &update.token_id,
+                            &update.condition_id,
+                            update.price,
+                            update.price,
+                            100.0, // Default size
+                        );
+                        pnl_tracker.record_trade(&trade);
                     }
                 }
             }
