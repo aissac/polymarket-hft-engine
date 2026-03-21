@@ -80,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
     
     // Initialize auth if private key is available
     if !private_key.is_empty() {
-        if let Err(e) = engine.init_auth(&private_key).await {
+        if let Err(e) = engine.init(&private_key).await {
             warn!("⚠️ Authentication failed: {} - continuing in read-only mode", e);
         }
     } else {

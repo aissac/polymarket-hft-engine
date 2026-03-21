@@ -30,6 +30,7 @@ chrono = { version = "0.4", features = ["serde"] }
 parking_lot = "0.12"
 
 # Polymarket SDK (Phase 2: Order execution)
+# Note: 'clob' feature not available in 0.3.x - using core functionality
 polymarket-client-sdk = { version = "0.3", features = ["ws", "tracing"] }
 
 # Alloy for signing (required by polymarket-client-sdk)

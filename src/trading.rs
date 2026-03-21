@@ -4,12 +4,12 @@
 //! Phase 2 executes orders when arbitrage is detected.
 
 use std::str::FromStr;
-use std::sync::Arc;
 
 use anyhow::Result;
-use alloy::signers::local::LocalSigner;
-use parking_lot::RwLock;
+use alloy::signers::local::PrivateKeySigner;
 use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
+use polymarket_client_sdk::clob::types::{Amount, OrderType, Side};
+use polymarket_client_sdk::types::Decimal;
 use tokio::sync::mpsc;
 use tracing::{info, error};
 
@@ -29,9 +29,9 @@ pub struct TradingConfig {
 impl Default for TradingConfig {
     fn default() -> Self {
         Self {
-            min_profit: 0.01,        // $0.01 minimum profit per share
-            max_leg_usdc: 50.0,     // $50 per leg max
-            dry_run: true,           // Default to dry-run (paper trading)
+            min_profit: 0.01,
+            max_leg_usdc: 50.0,
+            dry_run: true,
         }
     }
 }
@@ -47,12 +47,13 @@ pub struct OrderResult {
     pub profit_estimate: f64,
 }
 
-/// Trading engine - wraps the authenticated CLOB client
+/// Trading engine using Polymarket CLOB SDK
 pub struct TradingEngine {
     config: TradingConfig,
-    /// Authenticated client stored as opaque pointer (avoiding type issues)
-    client: Option<String>, // Just store a marker for now - real impl in Phase 2.5
-    pending_orders: Arc<RwLock<Vec<OrderResult>>>,
+    /// Signer for transactions
+    signer: Option<PrivateKeySigner>,
+    /// CLOB API URL
+    api_url: String,
 }
 
 impl TradingEngine {
@@ -60,46 +61,40 @@ impl TradingEngine {
     pub fn new(config: TradingConfig) -> Self {
         Self {
             config,
-            client: None,
-            pending_orders: Arc::new(RwLock::new(Vec::new())),
+            signer: None,
+            api_url: "https://clob.polymarket.com".to_string(),
         }
     }
 
-    /// Initialize authentication with private key
-    pub async fn init_auth(&mut self, private_key: &str) -> Result<()> {
-        info!("🔐 Initializing Polymarket authentication...");
+    /// Initialize with private key
+    pub async fn init(&mut self, private_key: &str) -> Result<()> {
+        info!("🔐 Initializing Polymarket trading...");
         
-        let _signer = LocalSigner::from_str(private_key)?;
-        let address = _signer.address();
+        let signer: PrivateKeySigner = PrivateKeySigner::from_str(private_key)?;
+        let address = signer.address();
         info!("📍 Wallet address: 0x{:x}", address);
         
-        let _unauth_client = ClobClient::new(
-            "https://clob.polymarket.com",
-            ClobConfig::default(),
-        )?;
-        
-        // Auth flow - storing marker for now
-        info!("✅ Authentication initialized (Phase 2.5 will complete order placement)");
-        self.client = Some("authenticated".to_string());
+        self.signer = Some(signer);
+        info!("✅ Trading engine ready (dry_run={})", self.config.dry_run);
         
         Ok(())
     }
 
-    /// Check if authenticated
-    pub fn is_authenticated(&self) -> bool {
-        self.client.is_some()
+    /// Check if initialized
+    pub fn is_ready(&self) -> bool {
+        self.signer.is_some()
     }
 
-    /// Execute arbitrage trade (dry-run only for now)
+    /// Execute arbitrage trade
     pub async fn execute_arbitrage(&self, market: &SimplifiedMarket) -> Result<OrderResult> {
-        if !self.is_authenticated() {
-            anyhow::bail!("Not authenticated. Call init_auth() first.");
+        if !self.is_ready() {
+            anyhow::bail!("Trading engine not initialized");
         }
         
         let yes_price = market.yes_price().unwrap_or(0.0);
         let no_price = market.no_price().unwrap_or(0.0);
         let combined = yes_price + no_price;
-        let profit = 1.0 - combined - (combined * 0.02); // After 2% fee
+        let profit = 1.0 - combined - (combined * 0.02);
         
         if profit <= self.config.min_profit {
             return Ok(OrderResult {
@@ -112,30 +107,28 @@ impl TradingEngine {
             });
         }
         
+        let size = (self.config.max_leg_usdc / yes_price.min(no_price)).floor();
+        
         info!(
-            "🎯 ARBITRAGE: {} | YES: ${:.4} + NO: ${:.4} = ${:.4} | Profit: ${:.4}",
-            market.condition_id, yes_price, no_price, combined, profit
+            "🎯 ARBITRAGE: {} | YES: ${:.4} + NO: ${:.4} = ${:.4} | Profit: ${:.4} | Size: {}",
+            market.condition_id, yes_price, no_price, combined, profit, size
         );
         
         if self.config.dry_run {
             info!("🔒 DRY RUN - No real orders placed");
             return Ok(OrderResult {
                 market_id: market.condition_id.clone(),
-                yes_order_id: Some("dry_run".to_string()),
-                no_order_id: Some("dry_run".to_string()),
+                yes_order_id: Some("dry_run_yes".to_string()),
+                no_order_id: Some("dry_run_no".to_string()),
                 yes_filled: true,
                 no_filled: true,
                 profit_estimate: profit,
             });
         }
         
-        // TODO: Implement real order placement in Phase 2.5
-        anyhow::bail!("Live trading not yet implemented - use dry_run mode");
-    }
-
-    /// Get pending orders count
-    pub fn pending_count(&self) -> usize {
-        self.pending_orders.read().len()
+        // Real order placement would go here in Phase 2.5
+        // Requires proper authenticated client management
+        anyhow::bail!("Live trading - use dry_run mode");
     }
 }
 
@@ -157,7 +150,7 @@ pub async fn start_trading_loop(
         match engine.execute_arbitrage(&signal.market).await {
             Ok(result) => {
                 if result.yes_order_id.is_some() {
-                    info!("✅ Trade executed: {}", result.market_id);
+                    info!("✅ Trade: {} profit=${:.4}", result.market_id, result.profit_estimate);
                 }
             }
             Err(e) => {
@@ -166,5 +159,5 @@ pub async fn start_trading_loop(
         }
     }
     
-    info!("🛑 Trading loop shutting down");
+    info!("🛑 Trading loop ended");
 }
