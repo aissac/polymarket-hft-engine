@@ -1,6 +1,7 @@
 //! Pingpong Strategy Engine
 //! 
-//! Phase 1: Read-only strategy that monitors for arbitrage opportunities.
+//! Phase 2: Read-only monitoring + Trading execution
+//! Monitors for arbitrage and signals the trading engine.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,6 +11,7 @@ use tracing::{info, debug, warn};
 
 use crate::orderbook::OrderBookTracker;
 use crate::api::{PolyClient, SimplifiedMarket};
+use crate::trading::ArbitrageSignal;
 
 const TARGET_HEDGE_SUM: f64 = 0.95;
 
@@ -42,6 +44,8 @@ pub struct PingpongStrategy {
     tracker: Arc<OrderBookTracker>,
     api: Arc<PolyClient>,
     events: mpsc::UnboundedSender<StrategyEvent>,
+    /// Optional channel to send arbitrage signals to trading engine
+    trading_tx: Option<mpsc::UnboundedSender<ArbitrageSignal>>,
 }
 
 impl PingpongStrategy {
@@ -55,13 +59,29 @@ impl PingpongStrategy {
             tracker,
             api,
             events,
+            trading_tx: None,
         }
     }
     
-    /// Main strategy loop (Phase 1: read-only monitoring)
+    /// With trading channel - enables order execution
+    pub fn with_trading_channel(
+        mut self,
+        tx: mpsc::UnboundedSender<ArbitrageSignal>,
+    ) -> Self {
+        self.trading_tx = Some(tx);
+        self
+    }
+    
+    pub fn set_trading_channel(&mut self, tx: Option<mpsc::UnboundedSender<ArbitrageSignal>>) {
+        self.trading_tx = tx;
+    }
+    
+    /// Main strategy loop (Phase 2: monitoring + trading)
     pub async fn run(&mut self) {
-        info!("🚀 Pingpong Strategy starting (PHASE 1: Read-Only Mode)");
+        info!("🚀 Pingpong Strategy starting (PHASE 2: Monitoring + Trading)");
         info!("📊 Target: {} for arbitrage detection", TARGET_HEDGE_SUM);
+        info!("📡 Trading mode: {}", 
+              if self.trading_tx.is_some() { "ENABLED" } else { "READ-ONLY" });
         
         // Check API health first
         if !self.check_api_health().await {
@@ -106,6 +126,7 @@ impl PingpongStrategy {
                                 profit
                             );
                             
+                            // Send event for logging
                             let _ = self.events.send(StrategyEvent::ArbitrageDetected {
                                 market: market.condition_id.clone(),
                                 yes_ask: yes_price.unwrap_or(0.0),
@@ -113,6 +134,17 @@ impl PingpongStrategy {
                                 combined,
                                 profit,
                             });
+                            
+                            // Send to trading engine if channel is available
+                            if let Some(ref tx) = self.trading_tx {
+                                let signal = ArbitrageSignal {
+                                    market: market.clone(),
+                                    profit,
+                                };
+                                if let Err(e) = tx.send(signal) {
+                                    warn!("Failed to send trading signal: {}", e);
+                                }
+                            }
                         }
                     }
                 }

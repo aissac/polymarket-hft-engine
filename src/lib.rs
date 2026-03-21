@@ -1,15 +1,17 @@
-//! Pingpong Bot - Phase 1: REST API + Orderbook Tracking
+//! Pingpong Bot - Phase 2: REST API + Orderbook + Trading
 //! 
 //! Uses Polymarket REST API to fetch markets and track prices.
-//! Phase 1 is READ-ONLY - no money risked, just proving the data pipeline
+//! Executes arbitrage trades via polymarket-client-sdk.
 
 mod orderbook;
 mod api;
 mod strategy;
+mod trading;
 
 pub use orderbook::OrderBookTracker;
 pub use api::PolyClient;
 pub use strategy::PingpongStrategy;
+pub use trading::{TradingEngine, TradingConfig, ArbitrageSignal};
 
 /// Target combined cost - if YES_ask + NO_ask < this, we have arbitrage
 /// 0.95 gives us ~3% profit after 2% Polymarket fee + slippage buffer

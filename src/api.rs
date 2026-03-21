@@ -39,6 +39,11 @@ impl TokenData {
             _ => None,
         }
     }
+    
+    /// Get token ID
+    pub fn token_id(&self) -> &str {
+        &self.token_id
+    }
 }
 
 /// Market from simplified-markets endpoint
@@ -63,6 +68,22 @@ impl SimplifiedMarket {
         self.tokens.iter()
             .find(|t| t.outcome.to_lowercase() == "no")
             .and_then(|t| t.price())
+    }
+    
+    /// Get YES token ID
+    pub fn yes_token_id(&self) -> String {
+        self.tokens.iter()
+            .find(|t| t.outcome.to_lowercase() == "yes")
+            .map(|t| t.token_id.clone())
+            .unwrap_or_default()
+    }
+    
+    /// Get NO token ID
+    pub fn no_token_id(&self) -> String {
+        self.tokens.iter()
+            .find(|t| t.outcome.to_lowercase() == "no")
+            .map(|t| t.token_id.clone())
+            .unwrap_or_default()
     }
     
     /// Combined cost (YES + NO)

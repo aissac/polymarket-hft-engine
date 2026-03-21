@@ -1,6 +1,6 @@
 [package]
 name = "pingpong"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [workspace]
@@ -28,3 +28,16 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Share state
 parking_lot = "0.12"
+
+# Polymarket SDK (Phase 2: Order execution)
+polymarket-client-sdk = { version = "0.3", features = ["ws", "tracing"] }
+
+# Alloy for signing (required by polymarket-client-sdk)
+alloy = { version = "1.7", features = ["sol-types", "signer-local"] }
+
+# Secrets management
+secrecy = "0.8"
+
+# Rust decimal for precise pricing
+rust_decimal = { version = "1.33", features = ["serde"] }
+rust_decimal_macros = "1.33"
