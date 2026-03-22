@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{info, warn, error};
+use tracing::{info, warn, error, debug};
 
 // Re-export OrderBookUpdate from websocket module
 use crate::websocket::OrderBookUpdate;
@@ -178,7 +178,10 @@ async fn maintain_ws_connection(
                 // Subscribe to tokens
                 let subscribe_msg = serde_json::json!({
                     "type": "market",
-                    "assets": tokens
+                    "operation": "subscribe",
+                    "markets": [],
+                    "assets_ids": tokens,
+                    "initial_dump": true
                 });
                 
                 if let Ok(msg_str) = serde_json::to_string(&subscribe_msg) {
@@ -191,6 +194,14 @@ async fn maintain_ws_connection(
                 while let Some(msg_result) = ws_stream.next().await {
                     match msg_result {
                         Ok(Message::Text(text)) => {
+                            // Debug: log first few messages to see format
+                            use std::sync::atomic::{AtomicUsize, Ordering};
+                            static COUNT: AtomicUsize = AtomicUsize::new(0);
+                            let cnt = COUNT.fetch_add(1, Ordering::Relaxed);
+                            if cnt < 5 {
+                                info!("RAW WS #{} len={} : {}", cnt, text.len(), &text[..text.len().min(400)]);
+                            }
+                            
                             // Parse orderbook update
                             if let Ok(update) = parse_orderbook_update(&text) {
                                 let _ = event_tx.send(WsEvent::Update(source, update));
@@ -237,16 +248,55 @@ async fn maintain_ws_connection(
 }
 
 /// Parse orderbook update from JSON
+/// Message format: [{"event_type":"book","asset_id":"...","market":"...","bids":[...],"asks":[...]}]
 fn parse_orderbook_update(text: &str) -> Result<OrderBookUpdate, serde_json::Error> {
     let json: serde_json::Value = serde_json::from_str(text)?;
     
+    // Message is an array - take first element
+    let obj = if json.is_array() {
+        json.as_array().and_then(|arr| arr.first()).unwrap_or(&json)
+    } else {
+        &json
+    };
+    
+    // Extract asset_id (token_id)
+    let token_id = obj["asset_id"].as_str().unwrap_or("").to_string();
+    let condition_id = obj["market"].as_str().map(|s| s.to_string()).unwrap_or(token_id.clone());
+    
+    // Get best bid (highest) and best ask (lowest)
+    let bids = obj["bids"].as_array();
+    let asks = obj["asks"].as_array();
+    
+    // Use best ask price as the mid-price reference
+    let best_ask = asks
+        .and_then(|a| a.first())
+        .and_then(|l| l["price"].as_str())
+        .and_then(|p| p.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    
+    let best_bid = bids
+        .and_then(|b| b.first())
+        .and_then(|l| l["price"].as_str())
+        .and_then(|p| p.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    
+    // Determine side and outcome from which book we're looking at
+    let side = if best_ask > 0.0 { "sell".to_string() } else { "buy".to_string() };
+    let outcome = "yes".to_string(); // Default - would need more context to determine
+    let price = best_ask;
+    let size = asks
+        .and_then(|a| a.first())
+        .and_then(|l| l["size"].as_str())
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    
     Ok(OrderBookUpdate {
-        condition_id: json["condition_id"].as_str().unwrap_or("").to_string(),
-        token_id: json["token_id"].as_str().unwrap_or("").to_string(),
-        side: json["side"].as_str().unwrap_or("").to_string(),
-        outcome: json["outcome"].as_str().unwrap_or("").to_string(),
-        price: json["price"].as_f64().unwrap_or(0.0),
-        size: json["size"].as_f64().unwrap_or(0.0),
+        condition_id,
+        token_id,
+        side,
+        outcome,
+        price,
+        size,
     })
 }
 
@@ -318,7 +368,10 @@ async fn start_trading_director(
                 state.orderbook.lock().insert(market_id.clone(), update.clone());
                 
                 // Forward to main loop for processing
-                let _ = update_tx.send(update);
+                let sent = update_tx.send(update);
+                if sent.is_err() {
+                    warn!("⚠️ Failed to send update to main loop - channel closed?");
+                }
                 
                 // Log periodically
                 if state.orderbook.lock().len() % 10 == 0 {

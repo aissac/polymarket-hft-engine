@@ -22,6 +22,14 @@ pub struct PriceLevel {
     pub size: f64,
 }
 
+/// Token data for a market
+#[derive(Debug, Clone)]
+pub struct TokenData {
+    pub token_id: String,
+    pub outcome: String,
+    pub price: Option<f64>,
+}
+
 /// YES/NO orderbook for a market
 #[derive(Debug, Clone, Default)]
 pub struct MarketOrderBook {

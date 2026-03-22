@@ -7,9 +7,10 @@ mod orderbook;
 mod api;
 mod strategy;
 mod trading;
+mod websocket;
 
 pub use orderbook::OrderBookTracker;
-pub use api::PolyClient;
+pub use api::{PolyClient, SimplifiedMarket, TokenData};
 pub use strategy::PingpongStrategy;
 pub use trading::{TradingEngine, TradingConfig, ArbitrageSignal};
 

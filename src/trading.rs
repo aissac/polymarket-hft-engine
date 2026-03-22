@@ -167,8 +167,8 @@ impl TradingEngine {
         info!("🔒 DRY RUN - Simulating concurrent EIP-712 signed orders...");
         
         // Bind token IDs to ensure they live long enough
-        let yes_token = market.yes_token_id();
-        let no_token = market.no_token_id();
+        let yes_token = market.yes_token_id().unwrap_or_default();
+        let no_token = market.no_token_id().unwrap_or_default();
         
         // Simulate concurrent order signing and submission
         let (yes_result, no_result) = tokio::join!(

@@ -165,8 +165,12 @@ async fn run_websocket_mode(
     let mut tokens: Vec<String> = Vec::new();
     
     for market in &markets {
-        tokens.push(market.yes_token_id());
-        tokens.push(market.no_token_id());
+        if let Some(yes_id) = market.yes_token_id() {
+            tokens.push(yes_id);
+        }
+        if let Some(no_id) = market.no_token_id() {
+            tokens.push(no_id);
+        }
     }
     
     // Create shared application state
@@ -199,6 +203,13 @@ async fn run_websocket_mode(
     loop {
         match update_rx.recv().await {
             Some(update) => {
+                // Debug: log first few updates
+                if scan_count < 5 {
+                    info!("📨 Received update for {} @ ${:.4}", 
+                        &update.condition_id[..8.min(update.condition_id.len())],
+                        update.price);
+                }
+                
                 scan_count += 1;
                 
                 // Evaluate with Gabagool strategy (simplified - uses same price for yes/no)

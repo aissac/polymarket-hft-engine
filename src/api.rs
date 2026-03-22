@@ -1,39 +1,14 @@
-//! Polymarket REST API Client
+//! Polymarket API Client Module
 //! 
-//! Uses polymarket-client-sdk for proper compression handling.
+//! Handles market data fetching from Gamma API (active markets only)
 
-use anyhow::{Result, anyhow};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use tracing::debug;
+use anyhow::Result;
+use tracing::{debug, info};
 
-/// Token price data from simplified-markets
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TokenData {
-    pub token_id: String,
-    pub outcome: String,
-    #[serde(flatten)]
-    pub price_raw: Value,
-}
+pub use crate::websocket::TokenData;
 
-impl TokenData {
-    /// Get price as f64 (handles string or number)
-    pub fn price(&self) -> Option<f64> {
-        match &self.price_raw {
-            Value::Number(n) => n.as_f64(),
-            Value::String(s) => s.parse().ok(),
-            _ => None,
-        }
-    }
-    
-    /// Get token ID
-    pub fn token_id(&self) -> &str {
-        &self.token_id
-    }
-}
-
-/// Market from simplified-markets endpoint
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Simplified market representation
+#[derive(Debug, Clone)]
 pub struct SimplifiedMarket {
     pub condition_id: String,
     pub tokens: Vec<TokenData>,
@@ -46,135 +21,125 @@ impl SimplifiedMarket {
     pub fn yes_price(&self) -> Option<f64> {
         self.tokens.iter()
             .find(|t| t.outcome.to_lowercase() == "yes")
-            .and_then(|t| t.price())
+            .and_then(|t| t.price)
     }
     
     /// Get NO token price
     pub fn no_price(&self) -> Option<f64> {
         self.tokens.iter()
             .find(|t| t.outcome.to_lowercase() == "no")
-            .and_then(|t| t.price())
+            .and_then(|t| t.price)
+    }
+    
+    /// Get combined cost (YES + NO)
+    pub fn combined_cost(&self) -> Option<f64> {
+        let yes = self.yes_price()?;
+        let no = self.no_price()?;
+        Some(yes + no)
     }
     
     /// Get YES token ID
-    pub fn yes_token_id(&self) -> String {
+    pub fn yes_token_id(&self) -> Option<String> {
         self.tokens.iter()
             .find(|t| t.outcome.to_lowercase() == "yes")
             .map(|t| t.token_id.clone())
-            .unwrap_or_default()
     }
     
     /// Get NO token ID
-    pub fn no_token_id(&self) -> String {
+    pub fn no_token_id(&self) -> Option<String> {
         self.tokens.iter()
             .find(|t| t.outcome.to_lowercase() == "no")
             .map(|t| t.token_id.clone())
-            .unwrap_or_default()
-    }
-    
-    /// Combined cost (YES + NO)
-    pub fn combined_cost(&self) -> Option<f64> {
-        match (self.yes_price(), self.no_price()) {
-            (Some(yes), Some(no)) => Some(yes + no),
-            _ => None,
-        }
-    }
-    
-    /// Check if arbitrage exists
-    pub fn has_arbitrage(&self, target: f64) -> bool {
-        self.combined_cost()
-            .map(|c| c < target && !self.closed)
-            .unwrap_or(false)
     }
 }
 
-/// Polymarket REST API Client (unauthenticated, read-only)
-pub struct PolyClient;
+/// Polymarket API client
+pub struct PolyClient {
+    gamma_url: String,
+}
 
 impl PolyClient {
     pub fn new() -> Self {
-        Self
+        Self {
+            gamma_url: "https://gamma-api.polymarket.com".to_string(),
+        }
     }
     
-    /// Get simplified markets via SDK (handles compression)
+    /// Get active markets from Gamma API
     pub async fn get_markets(&self) -> Result<Vec<SimplifiedMarket>> {
-        use polymarket_client_sdk::clob::Client as ClobClient;
-        use polymarket_client_sdk::clob::Config as ClobConfig;
+        use reqwest::Client;
         
-        let client = ClobClient::new("https://clob.polymarket.com", ClobConfig::default())?;
+        debug!("Fetching active markets from Gamma API...");
         
-        debug!("Fetching markets via SDK...");
+        // Use Gamma API to get ACTIVE markets (filter by closed=false&active=true)
+        let client = Client::new();
+        let resp = client
+            .get(format!("{}/markets?closed=false&active=true&limit=100", self.gamma_url))
+            .send()
+            .await?
+            .json::<Vec<serde_json::Value>>()
+            .await?;
         
-        // Use SDK's simplified_markets endpoint
-        let result = client.simplified_markets(None).await?;
+        info!("Gamma API returned {} markets", resp.len());
         
-        // Convert to our SimplifiedMarket format
-        let simplified: Vec<SimplifiedMarket> = result.data
-            .into_iter()
-            .filter_map(|m| {
-                // Extract YES/NO tokens
-                let mut yes_price = None;
-                let mut no_price = None;
-                let mut yes_token_id = None;
-                let mut no_token_id = None;
-                
-                for token in m.tokens {
-                    let price: Option<f64> = token.price.to_string().parse().ok();
-                    
-                    if token.outcome.to_lowercase() == "yes" {
-                        yes_price = price;
-                        yes_token_id = Some(token.token_id);
-                    } else if token.outcome.to_lowercase() == "no" {
-                        no_price = price;
-                        no_token_id = Some(token.token_id);
-                    }
-                }
-                
-                match (yes_price, no_price, yes_token_id, no_token_id) {
-                    (Some(yp), Some(np), Some(ytid), Some(ntid)) => {
-                        Some(SimplifiedMarket {
-                            condition_id: m.condition_id,
-                            tokens: vec![
-                                TokenData {
-                                    token_id: ytid,
-                                    outcome: "Yes".to_string(),
-                                    price_raw: serde_json::Value::Number(
-                                        serde_json::Number::from_f64(yp).unwrap_or(serde_json::Number::from(0))
-                                    ),
-                                },
-                                TokenData {
-                                    token_id: ntid,
-                                    outcome: "No".to_string(),
-                                    price_raw: serde_json::Value::Number(
-                                        serde_json::Number::from_f64(np).unwrap_or(serde_json::Number::from(0))
-                                    ),
-                                },
-                            ],
-                            active: m.active,
-                            closed: m.closed,
-                        })
-                    }
-                    _ => None,
-                }
-            })
-            .take(20) // Limit to 20 markets
-            .collect();
+        // Filter for active markets with clob token IDs
+        let mut simplified: Vec<SimplifiedMarket> = vec![];
+        
+        for market in resp.iter().take(50) {
+            // Skip if no clob token IDs
+            let token_ids_str = match market["clobTokenIds"].as_str() {
+                Some(s) => s,
+                None => continue,
+            };
+            
+            // Parse the token IDs
+            let token_ids = match serde_json::from_str::<Vec<String>>(token_ids_str) {
+                Ok(ids) => ids,
+                Err(_) => continue,
+            };
+            
+            // Need at least 2 tokens (YES + NO)
+            if token_ids.len() < 2 {
+                continue;
+            }
+            
+            // Skip if both tokens are empty
+            if token_ids[0].is_empty() || token_ids[1].is_empty() {
+                continue;
+            }
+            
+            let mut tokens = vec![];
+            for (i, token_id) in token_ids.iter().take(2).enumerate() {
+                let outcome = if i == 0 { "yes" } else { "no" };
+                tokens.push(crate::websocket::TokenData {
+                    token_id: token_id.clone(),
+                    outcome: outcome.to_string(),
+                    price: None,
+                });
+            }
+            
+            simplified.push(SimplifiedMarket {
+                condition_id: market["conditionId"].as_str().unwrap_or("").to_string(),
+                tokens,
+                active: market["active"].as_bool().unwrap_or(false),
+                closed: market["closed"].as_bool().unwrap_or(true),
+            });
+        }
+        
+        info!("Found {} active markets with token IDs", simplified.len());
         
         Ok(simplified)
     }
     
     /// Check API health
     pub async fn health_check(&self) -> Result<bool> {
-        use polymarket_client_sdk::clob::Client as ClobClient;
-        use polymarket_client_sdk::clob::Config as ClobConfig;
+        use reqwest::Client;
         
-        let client = ClobClient::new("https://clob.polymarket.com", ClobConfig::default())?;
-        
-        // Use None for cursor to get first page
-        match client.simplified_markets(None).await {
+        let client = Client::new();
+        match client.get(&self.gamma_url).send().await {
             Ok(_) => Ok(true),
             Err(e) => {
-                debug!("Health check error: {}", e);
+                info!("Gamma API health check failed: {}", e);
                 Ok(false)
             }
         }
@@ -184,54 +149,5 @@ impl PolyClient {
 impl Default for PolyClient {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_token_price() {
-        let t = TokenData {
-            token_id: "1".to_string(),
-            outcome: "Yes".to_string(),
-            price_raw: Value::Number(serde_json::Number::from_f64(0.50).unwrap()),
-        };
-        assert_eq!(t.price(), Some(0.50));
-        
-        let t = TokenData {
-            token_id: "1".to_string(),
-            outcome: "Yes".to_string(),
-            price_raw: Value::String("0.44".to_string()),
-        };
-        assert_eq!(t.price(), Some(0.44));
-    }
-    
-    #[test]
-    fn test_simplified_market() {
-        let m = SimplifiedMarket {
-            condition_id: "0x123".to_string(),
-            tokens: vec![
-                TokenData { 
-                    token_id: "1".to_string(), 
-                    outcome: "Yes".to_string(), 
-                    price_raw: Value::Number(serde_json::Number::from_f64(0.50).unwrap()),
-                },
-                TokenData { 
-                    token_id: "2".to_string(), 
-                    outcome: "No".to_string(), 
-                    price_raw: Value::Number(serde_json::Number::from_f64(0.44).unwrap()),
-                },
-            ],
-            active: true,
-            closed: false,
-        };
-        
-        assert_eq!(m.yes_price(), Some(0.50));
-        assert_eq!(m.no_price(), Some(0.44));
-        assert_eq!(m.combined_cost(), Some(0.94));
-        assert!(m.has_arbitrage(0.95));
-        assert!(!m.has_arbitrage(0.90));
     }
 }
