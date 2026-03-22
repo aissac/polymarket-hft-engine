@@ -1,7 +1,7 @@
 //! Pingpong - Main Entry Point
 //! 
-//! Phase 3.5: Hot Switchover Manager + In-Memory Director
-//! Primary + Backup WebSockets with auto-failover
+//! Phase 4.0: Gabagool Strategy - Expensive-side skew + directional betting
+//! Based on RD Olivaw's proven PingPong strategy
 
 use std::env;
 use std::sync::Arc;
@@ -16,6 +16,7 @@ mod trading;
 mod websocket;
 mod hot_switchover;
 mod pnl;
+mod gabagool_strategy;
 
 use api::PolyClient;
 use strategy::{PingpongStrategy, StrategyEvent};
@@ -23,6 +24,7 @@ use trading::{TradingEngine, TradingConfig, start_trading_loop, ArbitrageSignal}
 use websocket::OrderBookUpdate;
 use hot_switchover::{run_hot_switchover_manager, AppState};
 use pnl::{PnlTracker, create_trade_result};
+use gabagool_strategy::{GabagoolStrategy, GabagoolConfig, TradingSignal};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -39,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
         .expect("Failed to set tracing subscriber");
     
     info!("═══════════════════════════════════════════════════════════════");
-    info!("   PINGPONG v0.3.6 - PnL Tracking Enabled");
+    info!("   PINGPONG v0.4.0 - Gabagool Strategy");
     info!("═══════════════════════════════════════════════════════════════");
     
     // Parse command line args
@@ -181,55 +183,96 @@ async fn run_websocket_mode(
     info!("═══════════════════════════════════════════════════════════════");
     info!("   🎯 PINGPONG REAL-TIME ARBITRAGE DETECTION");
     info!("   🛡️  Hot Switchover: Primary + Backup Active");
+    info!("   📊 Gabagool Strategy v1.0 (expensive-side skew + directional)");
     info!("═══════════════════════════════════════════════════════════════");
     info!("   Monitoring {} markets in real-time", markets.len());
+    info!("   Min edge: 0.1% | Skew: 3x when price > $0.55");
+    info!("   Directional confidence: 70%+ | Position limit: 150 shares");
     info!("");
+    
+    // Initialize Gabagool strategy
+    let gabagool = GabagoolStrategy::new(GabagoolConfig::default());
     
     // Process updates from the Trading Director
     let mut scan_count = 0u64;
-    let target_hedge = 1.05; // Combined cost threshold
     
     loop {
         match update_rx.recv().await {
             Some(update) => {
                 scan_count += 1;
                 
-                // Simple arbitrage check (director already filtered noise)
-                let combined = update.price * 2.0; // Rough estimate
+                // Evaluate with Gabagool strategy (simplified - uses same price for yes/no)
+                let yes_price = update.price;
+                let no_price = update.price;
+                let signal = gabagool.evaluate_prices(yes_price, no_price);
                 
                 // Log periodically
                 if scan_count % 100 == 0 {
                     info!(
-                        "📋 {} | Price: ${:.4} | Combined: ${:.4}",
+                        "📋 Scan #{:06} | {} | Price: ${:.4}",
+                        scan_count,
                         &update.condition_id[..8.min(update.condition_id.len())],
-                        update.price,
-                        combined
+                        update.price
                     );
                 }
                 
-                // Check for arbitrage opportunity
-                if combined < target_hedge && combined > 0.0 {
-                    let profit = 1.0 - combined - (combined * 0.02);
-                    if profit > 0.01 {
+                // Handle trading signal
+                match signal {
+                    TradingSignal::Arbitrage { yes_price, no_price, combined, edge, skew_multiplier } => {
                         info!(
-                            "🎯 ARBITRAGE OPPORTUNITY! {} | Combined: ${:.4} | Profit: ${:.4}/share",
-                            &update.condition_id[..8.min(update.condition_id.len())],
+                            "🎯 ARB OPPORTUNITY! | Combined: ${:.4} | Edge: {:.2}% | Skew: {:.1}x",
                             combined,
-                            profit
+                            edge * 100.0,
+                            skew_multiplier
                         );
-                        
-                        // Record arbitrage opportunity
                         pnl_tracker.record_arb_opportunity();
                         
-                        // Record simulated trade for PnL tracking
                         let trade = create_trade_result(
                             &update.token_id,
                             &update.condition_id,
-                            update.price,
-                            update.price,
-                            100.0, // Default size
+                            yes_price,
+                            no_price,
+                            100.0 * skew_multiplier,
                         );
                         pnl_tracker.record_trade(&trade);
+                    }
+                    TradingSignal::Directional { side, price, confidence, edge, skew_multiplier } => {
+                        info!(
+                            "📈 DIRECTIONAL | {:?} @ ${:.4} | Conf: {:.1}% | Edge: {:.2}% | Skew: {:.1}x",
+                            side,
+                            price,
+                            confidence * 100.0,
+                            edge * 100.0,
+                            skew_multiplier
+                        );
+                        pnl_tracker.record_arb_opportunity();
+                        
+                        let trade = create_trade_result(
+                            &update.token_id,
+                            &update.condition_id,
+                            price,
+                            price,
+                            100.0 * skew_multiplier,
+                        );
+                        pnl_tracker.record_trade(&trade);
+                    }
+                    TradingSignal::Taker { side, price, edge } => {
+                        info!(
+                            "⚡ TAKER | {:?} @ ${:.4} | Edge: {:.2}%",
+                            side,
+                            price,
+                            edge * 100.0
+                        );
+                    }
+                    TradingSignal::TopUp { side, shares } => {
+                        info!(
+                            "🔄 TOP-UP | {:?} | {} shares",
+                            side,
+                            shares
+                        );
+                    }
+                    TradingSignal::None => {
+                        // No signal, continue scanning
                     }
                 }
             }
