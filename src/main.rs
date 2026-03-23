@@ -255,13 +255,20 @@ async fn run_websocket_mode(
                     
                     // Handle if in sweet spot
                     if in_sweet_spot && good_edge {
+                        // Get orderbook snapshot for liquidity verification
+                        let orderbook_size = {
+                            let ob = state.orderbook.lock();
+                            ob.get(&condition_id).map(|u| u.size).unwrap_or(0.0)
+                        };
+
                         info!(
-                            "🎯 SWEET SPOT ARB! | {} | YES: ${:.4} + NO: ${:.4} = ${:.4} | Edge: {:.1}%",
+                            "🎯 SWEET SPOT ARB! | {} | YES: ${:.4} + NO: ${:.4} = ${:.4} | Edge: {:.1}% | Size: {:.0}",
                             &condition_id[..8.min(condition_id.len())],
                             yes_price,
                             no_price,
                             combined,
-                            edge * 100.0
+                            edge * 100.0,
+                            orderbook_size
                         );
                         
                         // Dynamic position sizing based on edge (Kelly-inspired)
@@ -340,13 +347,13 @@ async fn run_websocket_mode(
                             );
                             pnl_tracker.record_trade(&trade);
                             
-                            // Log detailed trade for PnL report
+                            // Log detailed trade for PnL report with liquidity info
                             let timestamp = chrono::Local::now().format("%H:%M:%S");
                             let gross_profit = shares_f - combined * shares_f - (combined * shares_f * 0.02);
                             let net_profit = gross_profit - 0.003;
                             info!(
-                                "✅ TRADE | {} | YES: ${:.4} x{} | NO: ${:.4} x{} | Comb: ${:.4} | Gross: ${:.4} | Gas: $0.003 | Net: ${:.4}",
-                                timestamp, yes_price, shares, no_price, shares, combined, gross_profit, net_profit
+                                "✅ TRADE | {} | YES: ${:.4} x{} | NO: ${:.4} x{} | Comb: ${:.4} | Gross: ${:.4} | Gas: $0.003 | Net: ${:.4} | Liq: {:.0}",
+                                timestamp, yes_price, shares, no_price, shares, combined, gross_profit, net_profit, orderbook_size
                             );
                         } else {
                             pnl_tracker.record_fill_failure();

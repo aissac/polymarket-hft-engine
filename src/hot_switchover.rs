@@ -45,8 +45,8 @@ pub struct AppState {
     pub orderbook: Mutex<HashMap<String, OrderBookUpdate>>,
     /// Token to side mapping: token_id → (condition_id, is_yes)
     pub token_side: Mutex<HashMap<String, (String, bool)>>,
-    /// YES/NO prices per condition: condition_id → (yes_price, no_price)
-    pub market_prices: Mutex<HashMap<String, (Option<f64>, Option<f64>)>>,
+    /// YES/NO prices per condition: condition_id → (yes_price, no_price, yes_size, no_size)
+    pub market_prices: Mutex<HashMap<String, (Option<f64>, Option<f64>, Option<f64>, Option<f64>)>>,
     /// Noise reduction: track last price bucket we traded at
     pub last_traded_bucket: Mutex<HashMap<String, u64>>,
     /// Number of consecutive reconnect failures
@@ -126,7 +126,7 @@ impl AppState {
         // Now update the price
         let combined = {
             let mut prices = self.market_prices.lock();
-            let entry = prices.entry(condition_id.clone()).or_insert((None, None));
+            let entry = prices.entry(condition_id.clone()).or_insert((None, None, None, None));
             
             if is_yes {
                 entry.0 = Some(price);
@@ -136,7 +136,7 @@ impl AppState {
             
             // Check if we have both
             match entry {
-                (Some(yes), Some(no)) => Some((yes.clone(), no.clone())),
+                (Some(yes), Some(no), _, _) => Some((yes.clone(), no.clone())),
                 _ => None,
             }
         };
@@ -148,7 +148,7 @@ impl AppState {
     /// Get combined price for a market
     pub fn get_combined(&self, condition_id: &str) -> Option<f64> {
         let prices = self.market_prices.lock();
-        prices.get(condition_id).and_then(|(yes, no)| {
+        prices.get(condition_id).and_then(|(yes, no, _, _)| {
             match (yes, no) {
                 (Some(y), Some(n)) => Some(y + n),
                 _ => None,
@@ -163,7 +163,7 @@ impl AppState {
         
         let combined = {
             let mut prices = self.market_prices.lock();
-            let entry = prices.entry(condition_id.to_string()).or_insert((None, None));
+            let entry = prices.entry(condition_id.to_string()).or_insert((None, None, None, None));
             
             if is_yes {
                 entry.0 = Some(price);
@@ -172,7 +172,7 @@ impl AppState {
             }
             
             match entry {
-                (Some(yes), Some(no)) => Some((yes.clone(), no.clone())),
+                (Some(yes), Some(no), _, _) => Some((yes.clone(), no.clone())),
                 _ => None,
             }
         };
@@ -180,11 +180,17 @@ impl AppState {
         combined.map(|(yes, no)| (condition_id.to_string(), yes, no))
     }
 
+    /// Get orderbook size for a specific token
+    pub fn get_size(&self, token_id: &str) -> Option<f64> {
+        let orderbook = self.orderbook.lock();
+        orderbook.get(token_id).map(|u| u.size)
+    }
+
     /// Check if price has moved to a new bucket (noise filtering)
     pub fn is_new_bucket(&self, market_id: &str, mid_price: f64) -> bool {
         let bucket = (mid_price * 100.0).ceil() as u64; // 1-cent buckets
         let mut buckets = self.last_traded_bucket.lock();
-        
+
         match buckets.get(market_id) {
             Some(&last_bucket) if last_bucket == bucket => false, // Same bucket = noise
             _ => {
@@ -192,6 +198,25 @@ impl AppState {
                 true // New bucket = significant move
             }
         }
+    }
+
+    /// Get full market snapshot: (yes_price, no_price, yes_size, no_size, combined, edge)
+    pub fn get_market_snapshot(&self, condition_id: &str) -> Option<(f64, f64, f64, f64, f64, f64)> {
+        let prices = self.market_prices.lock();
+        let orderbook = self.orderbook.lock();
+
+        if let Some((yes_price, no_price, _, _)) = prices.get(condition_id) {
+            let (yes, no) = (*yes_price, *no_price);
+            if let (Some(yp), Some(np)) = (yes, no) {
+                // Get sizes from orderbook
+                // We need to look up by token_id... for now return 0.0 for sizes
+                // This is a limitation - the orderbook stores by condition_id, not token_id
+                let combined = yp + np;
+                let edge = 1.0 - combined - (combined * 0.02);
+                return Some((yp, np, 0.0, 0.0, combined, edge));
+            }
+        }
+        None
     }
 }
 
