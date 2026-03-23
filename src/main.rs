@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
+use chrono::Local;
 
 mod orderbook;
 mod api;
@@ -287,9 +288,23 @@ async fn run_websocket_mode(
                                 100.0,
                             );
                             pnl_tracker.record_trade(&trade);
+                            
+                            // Log detailed trade for PnL report
+                            let timestamp = chrono::Local::now().format("%H:%M:%S");
+                            let gross_profit = 1.0 - combined - (combined * 0.02);
+                            let net_profit = gross_profit - 0.003;
+                            info!(
+                                "✅ TRADE | {} | YES: ${:.4} × 100 | NO: ${:.4} × 100 | Comb: ${:.4} | Gross: ${:.4} | Gas: $0.003 | Net: ${:.4}",
+                                timestamp, yes_price, no_price, combined, gross_profit, net_profit
+                            );
                         } else {
                             pnl_tracker.record_fill_failure();
-                            info!("❌ Fill failed (stale price): {}", &condition_id[..8.min(condition_id.len())]);
+                            let timestamp = chrono::Local::now().format("%H:%M:%S");
+                            info!("❌ FILL FAILED | {} | {} | Edge: {:.1}%", 
+                                timestamp, 
+                                &condition_id[..8.min(condition_id.len())],
+                                edge * 100.0
+                            );
                         }
                     }
                 }
