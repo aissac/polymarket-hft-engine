@@ -38,6 +38,10 @@ pub struct PnlState {
     pub cumulative_fees: f64,
     pub arb_opportunities: u32,
     pub arb_executed: u32,
+    // Fill rate tracking
+    pub fills_attempted: u32,
+    pub fills_succeeded: u32,
+    pub fills_failed: u32,
     // Track individual yes/no prices per market
     pub market_prices: HashMap<String, (Option<f64>, Option<f64>)>,
 }
@@ -55,6 +59,9 @@ impl PnlState {
             cumulative_fees: 0.0,
             arb_opportunities: 0,
             arb_executed: 0,
+            fills_attempted: 0,
+            fills_succeeded: 0,
+            fills_failed: 0,
             market_prices: HashMap::new(),
         }
     }
@@ -122,6 +129,16 @@ impl PnlState {
         report.push_str(&format!("Arb Executed:      {}\n", self.arb_executed));
         report.push_str(&format!("Execution Rate:    {:.2}%\n", 
             if self.arb_opportunities > 0 { (self.arb_executed as f64 / self.arb_opportunities as f64) * 100.0 } else { 0.0 }));
+        
+        report.push_str("\n");
+        
+        report.push_str("📡 FILL RATE (LIVE ONLY)\n");
+        report.push_str("─────────────────────────────────────\n");
+        report.push_str(&format!("Fills Attempted:  {}\n", self.fills_attempted));
+        report.push_str(&format!("Fills Succeeded:   {}\n", self.fills_succeeded));
+        report.push_str(&format!("Fills Failed:      {}\n", self.fills_failed));
+        report.push_str(&format!("Fill Rate:         {:.1}%\n", 
+            if self.fills_attempted > 0 { (self.fills_succeeded as f64 / self.fills_attempted as f64) * 100.0 } else { 0.0 }));
         
         report.push_str("\n═══════════════════════════════════════\n");
         
@@ -255,6 +272,31 @@ impl PnlTracker {
         let mut s = self.state.lock();
         s.arb_opportunities += 1;
     }
+    
+    /// Record a fill attempt (when we try to execute)
+    pub fn record_fill_attempt(&self) {
+        let mut s = self.state.lock();
+        s.fills_attempted += 1;
+    }
+    
+    /// Record a successful fill
+    pub fn record_fill_success(&self) {
+        let mut s = self.state.lock();
+        s.fills_succeeded += 1;
+    }
+    
+    /// Record a failed fill
+    pub fn record_fill_failure(&self) {
+        let mut s = self.state.lock();
+        s.fills_failed += 1;
+    }
+    
+    /// Get fill rate as percentage
+    pub fn get_fill_rate(&self) -> f64 {
+        let s = self.state.lock();
+        if s.fills_attempted == 0 { return 0.0; }
+        (s.fills_succeeded as f64 / s.fills_attempted as f64) * 100.0
+    }
 
     /// Get current state snapshot
     pub fn get_state(&self) -> PnlState {
@@ -270,6 +312,9 @@ impl PnlTracker {
             cumulative_fees: s.cumulative_fees,
             arb_opportunities: s.arb_opportunities,
             arb_executed: s.arb_executed,
+            fills_attempted: s.fills_attempted,
+            fills_succeeded: s.fills_succeeded,
+            fills_failed: s.fills_failed,
             market_prices: s.market_prices.clone(),
         }
     }

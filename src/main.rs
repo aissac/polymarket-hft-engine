@@ -258,15 +258,35 @@ async fn run_websocket_mode(
                             edge * 100.0
                         );
                         pnl_tracker.record_arb_opportunity();
+                        pnl_tracker.record_fill_attempt();
                         
-                        let trade = create_trade_result(
-                            &update.token_id,
-                            &condition_id,
-                            yes_price,
-                            no_price,
-                            100.0,
-                        );
-                        pnl_tracker.record_trade(&trade);
+                        // Simulate fill rate based on edge quality
+                        // Higher edge = more likely to still be available
+                        let fill_probability = if edge >= 0.20 {
+                            0.80 // 80% for high edge
+                        } else if edge >= 0.15 {
+                            0.70 // 70% for medium edge
+                        } else {
+                            0.60 // 60% for low edge
+                        };
+                        
+                        // In dry run, simulate fill success/failure based on edge
+                        // Use combined price digits as pseudo-random
+                        let pseudo_rand = (combined * 1000.0).fract();
+                        if pseudo_rand < fill_probability {
+                            pnl_tracker.record_fill_success();
+                            let trade = create_trade_result(
+                                &update.token_id,
+                                &condition_id,
+                                yes_price,
+                                no_price,
+                                100.0,
+                            );
+                            pnl_tracker.record_trade(&trade);
+                        } else {
+                            pnl_tracker.record_fill_failure();
+                            info!("❌ Fill failed (stale price): {}", &condition_id[..8.min(condition_id.len())]);
+                        }
                     }
                 }
                 
