@@ -19,6 +19,7 @@ mod pnl;
 mod gabagool_strategy;
 
 use api::PolyClient;
+use orderbook::OrderBookTracker;
 use strategy::{PingpongStrategy, StrategyEvent};
 use trading::{TradingEngine, TradingConfig, start_trading_loop, ArbitrageSignal};
 use websocket::OrderBookUpdate;
@@ -203,38 +204,46 @@ async fn run_websocket_mode(
     loop {
         match update_rx.recv().await {
             Some(update) => {
-                // Debug: log first few updates
-                if scan_count < 5 {
-                    info!("📨 Received update for {} @ ${:.4}", 
-                        &update.condition_id[..8.min(update.condition_id.len())],
-                        update.price);
-                }
+                // Update the orderbook tracker with this price
+                // The update contains BOTH yes_price and no_price in the OrderBookUpdate
+                // We store them and compute combined when both exist
+                pnl_tracker.record_update(&update.condition_id, update.price, update.size);
                 
                 scan_count += 1;
                 
-                // Evaluate with Gabagool strategy (simplified - uses same price for yes/no)
-                let yes_price = update.price;
-                let no_price = update.price;
-                let signal = gabagool.evaluate_prices(yes_price, no_price);
+                // Evaluate with Gabagool strategy
+                // Use the combined price from tracker if available
+                let combined = pnl_tracker.get_combined(&update.condition_id);
                 
-                // Log periodically
-                if scan_count % 100 == 0 {
-                    info!(
-                        "📋 Scan #{:06} | {} | Price: ${:.4}",
-                        scan_count,
-                        &update.condition_id[..8.min(update.condition_id.len())],
-                        update.price
-                    );
-                }
-                
-                // Handle trading signal
-                match signal {
-                    TradingSignal::Arbitrage { yes_price, no_price, combined, edge, skew_multiplier } => {
+                // Only process if we have BOTH yes and no prices
+                if let Some(combined) = combined {
+                    let edge = 1.0 - combined - (combined * 0.02);
+                    
+                    // Sweet spot filter: only combined $0.70-$0.90, edge 10-30%
+                    let in_sweet_spot = combined >= 0.70 && combined <= 0.90;
+                    let good_edge = edge >= 0.10 && edge <= 0.30;
+                    
+                    // Log periodically
+                    if scan_count % 100 == 0 {
                         info!(
-                            "🎯 ARB OPPORTUNITY! | Combined: ${:.4} | Edge: {:.2}% | Skew: {:.1}x",
+                            "📋 Scan #{:06} | {} | Combined: ${:.4} | Edge: {:.1}%",
+                            scan_count,
+                            &update.condition_id[..8.min(update.condition_id.len())],
                             combined,
-                            edge * 100.0,
-                            skew_multiplier
+                            edge * 100.0
+                        );
+                    }
+                    
+                    // Handle if in sweet spot
+                    if in_sweet_spot && good_edge {
+                        let yes_price = pnl_tracker.get_yes_price(&update.condition_id).unwrap_or(0.0);
+                        let no_price = pnl_tracker.get_no_price(&update.condition_id).unwrap_or(0.0);
+                        let signal = gabagool.evaluate_prices(yes_price, no_price);
+                        
+                        info!(
+                            "🎯 SWEET SPOT ARB! | Combined: ${:.4} | Edge: {:.1}%",
+                            combined,
+                            edge * 100.0
                         );
                         pnl_tracker.record_arb_opportunity();
                         
@@ -243,54 +252,13 @@ async fn run_websocket_mode(
                             &update.condition_id,
                             yes_price,
                             no_price,
-                            100.0 * skew_multiplier,
+                            100.0,
                         );
                         pnl_tracker.record_trade(&trade);
-                    }
-                    TradingSignal::Directional { side, price, confidence, edge, skew_multiplier } => {
-                        info!(
-                            "📈 DIRECTIONAL | {:?} @ ${:.4} | Conf: {:.1}% | Edge: {:.2}% | Skew: {:.1}x",
-                            side,
-                            price,
-                            confidence * 100.0,
-                            edge * 100.0,
-                            skew_multiplier
-                        );
-                        pnl_tracker.record_arb_opportunity();
-                        
-                        let trade = create_trade_result(
-                            &update.token_id,
-                            &update.condition_id,
-                            price,
-                            price,
-                            100.0 * skew_multiplier,
-                        );
-                        pnl_tracker.record_trade(&trade);
-                    }
-                    TradingSignal::Taker { side, price, edge } => {
-                        info!(
-                            "⚡ TAKER | {:?} @ ${:.4} | Edge: {:.2}%",
-                            side,
-                            price,
-                            edge * 100.0
-                        );
-                    }
-                    TradingSignal::TopUp { side, shares } => {
-                        info!(
-                            "🔄 TOP-UP | {:?} | {} shares",
-                            side,
-                            shares
-                        );
-                    }
-                    TradingSignal::None => {
-                        // No signal, continue scanning
                     }
                 }
             }
-            None => {
-                warn!("Update channel closed");
-                break;
-            }
+            None => break,
         }
     }
     

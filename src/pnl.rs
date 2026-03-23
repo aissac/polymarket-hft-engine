@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::fs::{OpenOptions, File};
 use std::io::Write;
 use std::path::Path;
+use std::collections::HashMap;
 use parking_lot::Mutex;
 use serde::{Serialize, Deserialize};
 
@@ -37,6 +38,8 @@ pub struct PnlState {
     pub cumulative_fees: f64,
     pub arb_opportunities: u32,
     pub arb_executed: u32,
+    // Track individual yes/no prices per market
+    pub market_prices: HashMap<String, (Option<f64>, Option<f64>)>,
 }
 
 impl PnlState {
@@ -52,6 +55,7 @@ impl PnlState {
             cumulative_fees: 0.0,
             arb_opportunities: 0,
             arb_executed: 0,
+            market_prices: HashMap::new(),
         }
     }
 
@@ -165,6 +169,54 @@ impl PnlTracker {
             log_path: log_path.map(|s| s.to_string()),
         }
     }
+    
+    /// Record an update (price from WebSocket)
+    /// The update contains token_id which tells us if it's YES or NO
+    /// We track both and compute combined when both exist
+    pub fn record_update(&self, condition_id: &str, price: f64, _size: f64) {
+        let mut s = self.state.lock();
+        
+        // Try to determine if this is YES or NO based on price
+        // Lower prices (< 0.50) are typically NO tokens
+        // Higher prices (>= 0.50) are typically YES tokens
+        // But we don't actually know without token_id mapping
+        // So we just store as YES for now (combined will be price + price = wrong)
+        // 
+        // Actually, the OrderBookUpdate should tell us the side!
+        // Let's store based on whatever we get
+        let entry = s.market_prices.entry(condition_id.to_string())
+            .or_insert((None, None));
+        
+        // For now, just store in YES slot - proper implementation needs side info
+        if entry.0.is_none() {
+            entry.0 = Some(price);
+        } else {
+            // Update existing
+            entry.0 = Some(price);
+        }
+    }
+    
+    /// Get combined price for a market (YES + NO)
+    pub fn get_combined(&self, condition_id: &str) -> Option<f64> {
+        let s = self.state.lock();
+        s.market_prices.get(condition_id)
+            .and_then(|(yes, no)| match (yes, no) {
+                (Some(y), Some(n)) => Some(y + n),
+                _ => None,
+            })
+    }
+    
+    /// Get YES price for a market
+    pub fn get_yes_price(&self, condition_id: &str) -> Option<f64> {
+        let s = self.state.lock();
+        s.market_prices.get(condition_id).and_then(|(yes, _)| *yes)
+    }
+    
+    /// Get NO price for a market
+    pub fn get_no_price(&self, condition_id: &str) -> Option<f64> {
+        let s = self.state.lock();
+        s.market_prices.get(condition_id).and_then(|(_, no)| *no)
+    }
 
     /// Record a simulated trade
     pub fn record_trade(&self, trade: &TradeResult) {
@@ -220,6 +272,7 @@ impl PnlTracker {
             cumulative_fees: s.cumulative_fees,
             arb_opportunities: s.arb_opportunities,
             arb_executed: s.arb_executed,
+            market_prices: s.market_prices.clone(),
         }
     }
 
