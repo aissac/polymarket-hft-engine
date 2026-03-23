@@ -2,6 +2,12 @@
 //! 
 //! Phase 2: Read-only monitoring + Trading execution
 //! Monitors for arbitrage and signals the trading engine.
+//! 
+//! Strategy: Focus on realistic, fillable opportunities
+//! - Sweet spot: Combined $0.70-$0.90 (less competition from HFT)
+//! - Minimum edge: 10% (filter out noise)
+//! - Maximum edge: 30% (extremely rare = likely stale)
+//! - Avoid >50% edges (usually stale/unfillable data)
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +19,16 @@ use crate::orderbook::OrderBookTracker;
 use crate::api::{PolyClient, SimplifiedMarket};
 use crate::trading::ArbitrageSignal;
 
-const TARGET_HEDGE_SUM: f64 = 1.05;
+/// Target combined cost - only trade in the "sweet spot"
+/// Combined $0.70-$0.90 = less competition, more fillable
+const SWEET_SPOT_MIN: f64 = 0.70;
+const SWEET_SPOT_MAX: f64 = 0.90;
+
+/// Minimum profit margin (after 2% fee) to consider a trade
+const MIN_EDGE: f64 = 0.10; // 10% minimum profit
+
+/// Maximum edge to consider (anything higher is likely stale)
+const MAX_EDGE: f64 = 0.30; // 30% max (beyond this = suspicious)
 
 /// Strategy state
 #[derive(Debug, Clone)]
@@ -78,8 +93,9 @@ impl PingpongStrategy {
     
     /// Main strategy loop (Phase 2: monitoring + trading)
     pub async fn run(&mut self) {
-        info!("🚀 Pingpong Strategy starting (PHASE 2: Monitoring + Trading)");
-        info!("📊 Target: {} for arbitrage detection", TARGET_HEDGE_SUM);
+        info!("🚀 Pingpong Strategy starting (SWEET SPOT MODE)");
+        info!("📊 Sweet spot: ${:.0}-${:.0} combined (edge: {:.0}%-{:.0}%)", 
+              SWEET_SPOT_MIN * 100.0, SWEET_SPOT_MAX * 100.0, MIN_EDGE * 100.0, MAX_EDGE * 100.0);
         info!("📡 Trading mode: {}", 
               if self.trading_tx.is_some() { "ENABLED" } else { "READ-ONLY" });
         
@@ -97,7 +113,11 @@ impl PingpongStrategy {
             // Fetch markets from API
             match self.api.get_markets().await {
                 Ok(markets) => {
-                    info!("📊 Scan #{}: {} markets", scan_count, markets.len());
+                    // Log scan periodically
+                    if scan_count % 20 == 0 {
+                        info!("📊 Scan #{}: {} markets | Sweet spot ARBs this cycle: looking...", 
+                              scan_count, markets.len());
+                    }
                     
                     // Update tracker and check for arbitrage
                     for market in &markets {
@@ -105,55 +125,61 @@ impl PingpongStrategy {
                         let no_price = market.no_price();
                         let combined = yes_price.zip(no_price).map(|(y, n)| y + n);
                         
-                        // Log market prices
-                        if scan_count % 10 == 0 || combined.is_some_and(|c| c < 1.05) {
-                            info!(
-                                "📋 {} | YES: ${:.4} | NO: ${:.4} | COMBINED: ${:.4}",
-                                &market.condition_id[..8.min(market.condition_id.len())],
-                                yes_price.unwrap_or(0.0),
-                                no_price.unwrap_or(0.0),
-                                combined.unwrap_or(0.0)
-                            );
-                        }
-                        
                         self.tracker.update(
                             &market.condition_id,
                             yes_price,
                             no_price,
                         );
                         
-                        // Check if this market has arbitrage (combined < 1.05)
-                        if combined.is_some_and(|c| c < TARGET_HEDGE_SUM) {
-                            let combined = market.combined_cost().unwrap_or(1.0);
-                            let profit = 1.0 - combined - (combined * 0.02); // After 2% fee
+                        // Check if this market has arbitrage in the SWEET SPOT
+                        // Only trade combined $0.70-$0.90 (realistic, fillable)
+                        if let Some(combined_val) = combined {
+                            // Calculate edge after 2% fee
+                            let edge = 1.0 - combined_val - (combined_val * 0.02);
                             
-                            info!(
-                                "🎯 ARBITRAGE OPPORTUNITY: {} | YES: ${:.4} + NO: ${:.4} = ${:.4} | Profit: ${:.4}/share",
-                                market.condition_id,
-                                yes_price.unwrap_or(0.0),
-                                no_price.unwrap_or(0.0),
-                                combined,
-                                profit
-                            );
+                            // Check if in sweet spot (70-90 cents combined)
+                            let in_sweet_spot = combined_val >= SWEET_SPOT_MIN && combined_val <= SWEET_SPOT_MAX;
                             
-                            // Send event for logging
-                            let _ = self.events.send(StrategyEvent::ArbitrageDetected {
-                                market: market.condition_id.clone(),
-                                yes_ask: yes_price.unwrap_or(0.0),
-                                no_ask: no_price.unwrap_or(0.0),
-                                combined,
-                                profit,
-                            });
-                            
-                            // Send to trading engine if channel is available
-                            if let Some(ref tx) = self.trading_tx {
-                                let signal = ArbitrageSignal {
-                                    market: market.clone(),
-                                    profit,
-                                };
-                                if let Err(e) = tx.send(signal) {
-                                    warn!("Failed to send trading signal: {}", e);
+                            // Only trade if in sweet spot AND has reasonable edge (10-30%)
+                            if in_sweet_spot && edge >= MIN_EDGE && edge <= MAX_EDGE {
+                                info!(
+                                    "🎯 SWEET SPOT ARB: {} | YES: ${:.4} + NO: ${:.4} = ${:.4} | Edge: {:.1}%",
+                                    &market.condition_id[..8.min(market.condition_id.len())],
+                                    yes_price.unwrap_or(0.0),
+                                    no_price.unwrap_or(0.0),
+                                    combined_val,
+                                    edge * 100.0
+                                );
+                                
+                                // Send event for logging
+                                let _ = self.events.send(StrategyEvent::ArbitrageDetected {
+                                    market: market.condition_id.clone(),
+                                    yes_ask: yes_price.unwrap_or(0.0),
+                                    no_ask: no_price.unwrap_or(0.0),
+                                    combined: combined_val,
+                                    profit: edge,
+                                });
+                                
+                                // Send to trading engine if channel is available
+                                if let Some(ref tx) = self.trading_tx {
+                                    let signal = ArbitrageSignal {
+                                        market: market.clone(),
+                                        profit: edge,
+                                    };
+                                    if let Err(e) = tx.send(signal) {
+                                        warn!("Failed to send trading signal: {}", e);
+                                    }
                                 }
+                            }
+                            
+                            // Log high-edge opportunities (stale) occasionally
+                            if edge > MAX_EDGE && scan_count % 50 == 0 {
+                                debug!(
+                                    "⚠️ High edge (stale?): {} | Combined: ${:.4} | Edge: {:.1}%",
+                                    &market.condition_id[..8.min(market.condition_id.len())],
+                                    combined_val,
+                                    edge * 100.0
+                                );
                             }
                         }
                     }
