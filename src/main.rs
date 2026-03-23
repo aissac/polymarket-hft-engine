@@ -303,15 +303,15 @@ async fn run_websocket_mode(
                                 &condition_id,
                                 yes_price,
                                 no_price,
-                                100.0,
+                                50.0,
                             );
                             pnl_tracker.record_trade(&trade);
                             
                             // Log detailed trade for PnL report
                             let timestamp = chrono::Local::now().format("%H:%M:%S");
-                            let gross_profit = 1.0 - combined - (combined * 0.02);
+                            let gross_profit = 0.5 - combined * 0.5 - (combined * 0.5 * 0.02);
                             let net_profit = gross_profit - 0.003;
-                            let shares = 100;
+                            let shares = 50;
                             info!(
                                 "✅ TRADE | {} | YES: ${:.4} x{} | NO: ${:.4} x{} | Comb: ${:.4} | Gross: ${:.4} | Gas: $0.003 | Net: ${:.4}",
                                 timestamp, yes_price, shares, no_price, shares, combined, gross_profit, net_profit
