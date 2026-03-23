@@ -171,28 +171,26 @@ impl PnlTracker {
     }
     
     /// Record an update (price from WebSocket)
-    /// The update contains token_id which tells us if it's YES or NO
-    /// We track both and compute combined when both exist
-    pub fn record_update(&self, condition_id: &str, price: f64, _size: f64) {
+    /// Properly tracks YES and NO prices separately
+    pub fn record_update(&self, condition_id: &str, price: f64, _size: f64, outcome: &str) {
         let mut s = self.state.lock();
         
-        // Try to determine if this is YES or NO based on price
-        // Lower prices (< 0.50) are typically NO tokens
-        // Higher prices (>= 0.50) are typically YES tokens
-        // But we don't actually know without token_id mapping
-        // So we just store as YES for now (combined will be price + price = wrong)
-        // 
-        // Actually, the OrderBookUpdate should tell us the side!
-        // Let's store based on whatever we get
         let entry = s.market_prices.entry(condition_id.to_string())
             .or_insert((None, None));
         
-        // For now, just store in YES slot - proper implementation needs side info
-        if entry.0.is_none() {
-            entry.0 = Some(price);
-        } else {
-            // Update existing
-            entry.0 = Some(price);
+        // Store based on outcome - YES or NO
+        match outcome.to_lowercase().as_str() {
+            "yes" => entry.0 = Some(price),
+            "no" => entry.1 = Some(price),
+            _ => {
+                // Fallback: try to guess based on price
+                // Lower prices are typically NO
+                if price < 0.50 {
+                    entry.1 = Some(price);
+                } else {
+                    entry.0 = Some(price);
+                }
+            }
         }
     }
     
