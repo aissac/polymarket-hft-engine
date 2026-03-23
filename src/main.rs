@@ -264,17 +264,27 @@ async fn run_websocket_mode(
                             edge * 100.0
                         );
                         
-                        // Calculate profit for minimum trade check
-                        // Set minimum to $0.20 net profit (realistic for 100 shares with decent edge)
-                        // net = (1-comb) - comb*0.02 - 0.003 >= 0.20
-                        // Solving: comb <= (1 - 0.20 - 0.003) / 1.02 = 0.777/1.02 ≈ 0.762
-                        // So combined <= $0.76 gives $0.20+ net profit (18%+ edge)
+                        // Dynamic position sizing based on edge (Kelly-inspired)
+                        // Bigger edge = more shares = more profit
+                        let shares = if edge >= 0.25 {
+                            100 // 25%+ edge: max shares
+                        } else if edge >= 0.20 {
+                            75  // 20-25% edge
+                        } else if edge >= 0.15 {
+                            50  // 15-20% edge
+                        } else {
+                            30  // 10-15% edge: min shares
+                        };
+                        let shares_f = shares as f64;
                         
-                        let gross_profit = 1.0 - combined - (combined * 0.02);
+                        // Calculate profit for minimum trade check
+                        // Scale minimum based on shares: require at least $0.10 per share
+                        let min_profit = shares_f * 0.10;
+                        let gross_profit = shares_f - combined * shares_f - (combined * shares_f * 0.02);
                         let net_profit = gross_profit - 0.003;
                         
-                        // Only execute if net profit >= $0.20 minimum
-                        if net_profit < 0.20 {
+                        // Only execute if net profit >= minimum threshold
+                        if net_profit < min_profit {
                             // Below minimum trade value - skip
                             continue;
                         }
@@ -300,7 +310,7 @@ async fn run_websocket_mode(
                         if pseudo_rand < fill_probability {
                             // Check 5-min rolling capital cap
                             let now = std::time::Instant::now();
-                            let trade_capital = combined * 50.0; // 50 shares
+                            let trade_capital = combined * shares_f; // Dynamic capital based on shares
                             
                             // Remove entries older than 5 minutes
                             capital_history.retain(|(time, _)| now.duration_since(*time).as_secs() < CAPITAL_WINDOW_SECS);
@@ -326,15 +336,14 @@ async fn run_websocket_mode(
                                 &condition_id,
                                 yes_price,
                                 no_price,
-                                50.0,
+                                shares_f,
                             );
                             pnl_tracker.record_trade(&trade);
                             
                             // Log detailed trade for PnL report
                             let timestamp = chrono::Local::now().format("%H:%M:%S");
-                            let gross_profit = 0.5 - combined * 0.5 - (combined * 0.5 * 0.02);
+                            let gross_profit = shares_f - combined * shares_f - (combined * shares_f * 0.02);
                             let net_profit = gross_profit - 0.003;
-                            let shares = 50;
                             info!(
                                 "✅ TRADE | {} | YES: ${:.4} x{} | NO: ${:.4} x{} | Comb: ${:.4} | Gross: ${:.4} | Gas: $0.003 | Net: ${:.4}",
                                 timestamp, yes_price, shares, no_price, shares, combined, gross_profit, net_profit
