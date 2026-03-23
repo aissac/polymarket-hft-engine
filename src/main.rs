@@ -203,6 +203,11 @@ async fn run_websocket_mode(
     // Initialize Gabagool strategy
     let gabagool = GabagoolStrategy::new(GabagoolConfig::default());
     
+    // 5-min rolling capital cap tracker
+    let mut capital_history: Vec<(std::time::Instant, f64)> = Vec::new();
+    const CAPITAL_WINDOW_SECS: u64 = 300; // 5 minutes
+    const MAX_CAPITAL_PER_WINDOW: f64 = 115.0; // $115 max per 5-min window
+    
     // Process updates from the Trading Director
     let mut scan_count = 0u64;
     let mut last_log_time = std::time::Instant::now();
@@ -293,6 +298,24 @@ async fn run_websocket_mode(
                         let pseudo_rand = (combined * 1000.0).fract();
                         
                         if pseudo_rand < fill_probability {
+                            // Check 5-min rolling capital cap
+                            let now = std::time::Instant::now();
+                            let trade_capital = combined * 50.0; // 50 shares
+                            
+                            // Remove entries older than 5 minutes
+                            capital_history.retain(|(time, _)| now.duration_since(*time).as_secs() < CAPITAL_WINDOW_SECS);
+                            
+                            // Sum capital deployed in window
+                            let current_capital: f64 = capital_history.iter().map(|(_, c)| c).sum();
+                            
+                            if current_capital + trade_capital > MAX_CAPITAL_PER_WINDOW {
+                                // Cap hit - skip this trade
+                                continue;
+                            }
+                            
+                            // Record this trade's capital
+                            capital_history.push((now, trade_capital));
+                            
                             pnl_tracker.record_fill_success();
                             
                             // Record gas cost (Polygon ~$0.003 per tx)
