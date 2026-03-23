@@ -8,11 +8,13 @@ mod api;
 mod strategy;
 mod trading;
 mod websocket;
+pub mod production;
 
 pub use orderbook::OrderBookTracker;
 pub use api::{PolyClient, SimplifiedMarket, TokenData};
 pub use strategy::PingpongStrategy;
 pub use trading::{TradingEngine, TradingConfig, ArbitrageSignal};
+pub use production::{ProductionGuard, CircuitBreaker, LiquidityCheck, GasEstimate, OrderManager, TradeType, TradingStats};
 
 /// Target combined cost - if YES_ask + NO_ask < this, we have arbitrage
 /// 0.95 gives us ~3% profit after 2% Polymarket fee + slippage buffer

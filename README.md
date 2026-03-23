@@ -13,10 +13,10 @@ Pingpong exploits pricing inefficiencies between YES and NO tokens on Polymarket
 
 ## Current Status
 
-✅ **v0.4.0 - Gabagool Strategy** running in production  
+✅ **v0.5.0 - Production Ready**  
 ✅ **50 active markets** being monitored  
 ✅ **Real-time WebSocket** streaming with primary + backup failover  
-✅ **$7,000+ theoretical PnL** per 100 opportunities (dry run)  
+✅ **Production guardrails** - liquidity checks, circuit breakers, gas optimization  
 ✅ **DRY RUN mode** - paper trading, no real orders  
 
 ## Architecture
@@ -25,35 +25,48 @@ Pingpong exploits pricing inefficiencies between YES and NO tokens on Polymarket
 pingpong/
 ├── src/
 │   ├── main.rs           # Entry point + CLI
-│   ├── lib.rs            # Core types & constants
+│   ├── lib.rs            # Core types & exports
 │   ├── api.rs            # Gamma API client (active markets)
 │   ├── hot_switchover.rs # WebSocket manager (primary + backup)
 │   ├── orderbook.rs      # Thread-safe price tracker
 │   ├── strategy.rs       # Arbitrage detection engine
 │   ├── trading.rs        # Order simulation & execution
-│   └── websocket.rs      # WebSocket types & helpers
+│   ├── websocket.rs      # WebSocket types & helpers
+│   └── production.rs     # Production guardrails (NEW)
 ├── examples/             # Test scripts
 └── Cargo.toml
 ```
 
-## Features
+## Production Features (v0.5.0)
 
-### Phase 4.0: Gabagool Strategy
-- Expensive-side skew: 3x position size when price > $0.55
-- Directional betting: 70%+ confidence triggers larger positions
-- Position limits: 150 shares per trade
+### 1. Liquidity Checks
+Before executing, the bot verifies:
+- **Minimum depth:** At least 100 shares at target price
+- **Max slippage:** 5% tolerance
+- **Slippage cost:** Max $1.00 per trade
 
-### Hot Switchover (Phase 3.5)
-- Dual WebSocket connections (primary + backup)
-- Automatic failover every ~2 minutes
-- Fresh snapshot on reconnect
-- Halt/resume trading on disconnect
+### 2. Circuit Breakers
+Risk management guards:
+- **Rate limiting:** Max 20 trades/minute
+- **Concurrent limit:** Max 5 simultaneous trades
+- **Daily loss cap:** $100 max daily loss
+- **Cooldown:** 60 seconds after circuit break
 
-### Real-Time Arbitrage Detection
-- WebSocket orderbook streaming
-- Noise filtering via price bucket tracking
-- In-flight trade locks (prevents duplicate execution)
-- Concurrent YES+NO order simulation
+### 3. Gas Optimization
+- **Gas estimation:** Realistic Polygon gas costs
+- **Maker orders:** Post bids/asks vs taking liquidity
+- **Batching:** Cancel + replace in single transaction
+- **Typical cost:** ~$0.01 per trade
+
+### 4. Gnosis Safe Support (Optional)
+- **Gasless trading:** Via EIP-1271 signatures
+- **No MATIC needed:** Safe wallet pays gas
+- **Signature Type 2:** EthSign for meta-transactions
+
+### 5. Order Expiration
+- **TTL tracking:** Orders auto-expire after set period
+- **Cleanup:** Expired orders removed from tracking
+- **Default:** 60 second order life
 
 ## Building
 
@@ -67,16 +80,41 @@ cargo build --release
 # Dry run (paper trading - no real orders)
 ./target/release/pingpong --ws
 
-# With private key (LIVE trading)
+# With private key (LIVE trading - requires VPS)
 POLYMARKET_PRIVATE_KEY=your_key ./target/release/pingpong --ws
+
+# With Gnosis Safe (gasless)
+SAFE_ADDRESS=0x... ./target/release/pingpong --ws
 ```
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `POLYMARKET_PRIVATE_KEY` | No | EIP-712 signing key for live trading |
-| `WS_URL` | No | WebSocket endpoint (default: Polymarket CLOB) |
+| `POLYMARKET_PRIVATE_KEY` | For live | EIP-712 signing key |
+| `SAFE_ADDRESS` | Optional | Gnosis Safe for gasless |
+| `WS_URL` | No | WebSocket endpoint |
+
+## Production Deployment
+
+### VPS Requirements
+- **Location:** AWS us-east-1 or equivalent (low latency to Polymarket)
+- **Specs:** 2 vCPU, 4GB RAM, SSD
+- **OS:** Ubuntu 22.04 LTS
+
+### Recommended Setup
+```bash
+# Install dependencies
+sudo apt update && sudo apt install -y build-essential pkg-config libssl-dev
+
+# Clone and build
+git clone https://github.com/aissac/polymarket-hft-engine.git
+cd polymarket-hft-engine/pingpong
+cargo build --release
+
+# Run with systemd (production)
+sudo cp deploy.sh /usr/local/bin/pingpong
+```
 
 ## PNL Simulation (Dry Run)
 
@@ -92,6 +130,8 @@ Based on 100 detected arbitrage opportunities:
 | > $0.70 | 9 | $0.13 | $121 |
 
 **100 trades @ 100 shares = $7,066 gross profit**
+
+**Realistic expectation after gas + slippage: $500-2000/day**
 
 ## License
 
