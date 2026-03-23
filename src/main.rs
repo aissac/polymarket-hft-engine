@@ -162,20 +162,24 @@ async fn run_websocket_mode(
     let markets = api.get_markets().await?;
     info!("📊 Fetched {} markets from REST API", markets.len());
     
-    // Collect all YES/NO token IDs
+    // Collect all YES/NO token IDs and build token→side mapping
     let mut tokens: Vec<String> = Vec::new();
+    let mut token_mapping: Vec<(String, String, bool)> = Vec::new(); // (cond_id, token_id, is_yes)
     
     for market in &markets {
         if let Some(yes_id) = market.yes_token_id() {
-            tokens.push(yes_id);
+            tokens.push(yes_id.clone());
+            token_mapping.push((market.condition_id.clone(), yes_id, true));
         }
         if let Some(no_id) = market.no_token_id() {
-            tokens.push(no_id);
+            tokens.push(no_id.clone());
+            token_mapping.push((market.condition_id.clone(), no_id, false));
         }
     }
     
     // Create shared application state
     let state = Arc::new(AppState::new());
+    state.build_token_mapping(&token_mapping);
     
     // Create channel for director to send updates
     let (update_tx, mut update_rx) = mpsc::unbounded_channel::<OrderBookUpdate>();
@@ -200,48 +204,56 @@ async fn run_websocket_mode(
     
     // Process updates from the Trading Director
     let mut scan_count = 0u64;
+    let mut last_log_time = std::time::Instant::now();
     
     loop {
         match update_rx.recv().await {
             Some(update) => {
-                // Update the orderbook tracker with this price
-                // The update contains BOTH yes_price and no_price in the OrderBookUpdate
-                // We store them and compute combined when both exist
-                pnl_tracker.record_update(&update.condition_id, update.price, update.size);
+                // Look up whether this token is YES or NO using our token mapping
+                // The Gamma API gives us token_ids, we assigned them as [0]=YES, [1]=NO
+                let outcome = {
+                    let mapping = state.token_side.lock();
+                    match mapping.get(&update.token_id) {
+                        Some((_, is_yes)) => {
+                            if *is_yes { "yes" } else { "no" }
+                        }
+                        None => {
+                            // Token not in mapping - skip
+                            continue;
+                        }
+                    }
+                };
                 
-                scan_count += 1;
-                
-                // Evaluate with Gabagool strategy
-                // Use the combined price from tracker if available
-                let combined = pnl_tracker.get_combined(&update.condition_id);
-                
-                // Only process if we have BOTH yes and no prices
-                if let Some(combined) = combined {
+                // Update the orderbook tracker using the outcome
+                if let Some((condition_id, yes_price, no_price)) = state.update_by_outcome(&update.condition_id, update.price, outcome) {
+                    // We have both prices now!
+                    let combined = yes_price + no_price;
                     let edge = 1.0 - combined - (combined * 0.02);
                     
                     // Sweet spot filter: only combined $0.70-$0.90, edge 10-30%
                     let in_sweet_spot = combined >= 0.70 && combined <= 0.90;
                     let good_edge = edge >= 0.10 && edge <= 0.30;
                     
-                    // Log periodically
-                    if scan_count % 100 == 0 {
+                    // Log periodically (every 5 seconds)
+                    if last_log_time.elapsed().as_secs() > 5 {
                         info!(
-                            "📋 Scan #{:06} | {} | Combined: ${:.4} | Edge: {:.1}%",
-                            scan_count,
-                            &update.condition_id[..8.min(update.condition_id.len())],
+                            "📋 {} | YES: ${:.4} + NO: ${:.4} = ${:.4} | Edge: {:.1}%",
+                            &condition_id[..8.min(condition_id.len())],
+                            yes_price,
+                            no_price,
                             combined,
                             edge * 100.0
                         );
+                        last_log_time = std::time::Instant::now();
                     }
                     
                     // Handle if in sweet spot
                     if in_sweet_spot && good_edge {
-                        let yes_price = pnl_tracker.get_yes_price(&update.condition_id).unwrap_or(0.0);
-                        let no_price = pnl_tracker.get_no_price(&update.condition_id).unwrap_or(0.0);
-                        let signal = gabagool.evaluate_prices(yes_price, no_price);
-                        
                         info!(
-                            "🎯 SWEET SPOT ARB! | Combined: ${:.4} | Edge: {:.1}%",
+                            "🎯 SWEET SPOT ARB! | {} | YES: ${:.4} + NO: ${:.4} = ${:.4} | Edge: {:.1}%",
+                            &condition_id[..8.min(condition_id.len())],
+                            yes_price,
+                            no_price,
                             combined,
                             edge * 100.0
                         );
@@ -249,7 +261,7 @@ async fn run_websocket_mode(
                         
                         let trade = create_trade_result(
                             &update.token_id,
-                            &update.condition_id,
+                            &condition_id,
                             yes_price,
                             no_price,
                             100.0,
@@ -257,6 +269,8 @@ async fn run_websocket_mode(
                         pnl_tracker.record_trade(&trade);
                     }
                 }
+                
+                scan_count += 1;
             }
             None => break,
         }

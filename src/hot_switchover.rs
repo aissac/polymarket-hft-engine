@@ -43,6 +43,10 @@ pub struct AppState {
     pub in_flight_trades: Mutex<HashSet<String>>,
     /// Local orderbook state
     pub orderbook: Mutex<HashMap<String, OrderBookUpdate>>,
+    /// Token to side mapping: token_id → (condition_id, is_yes)
+    pub token_side: Mutex<HashMap<String, (String, bool)>>,
+    /// YES/NO prices per condition: condition_id → (yes_price, no_price)
+    pub market_prices: Mutex<HashMap<String, (Option<f64>, Option<f64>)>>,
     /// Noise reduction: track last price bucket we traded at
     pub last_traded_bucket: Mutex<HashMap<String, u64>>,
     /// Number of consecutive reconnect failures
@@ -55,6 +59,8 @@ impl AppState {
             risk_paused: AtomicBool::new(true), // Paused until first WS connects
             in_flight_trades: Mutex::new(HashSet::new()),
             orderbook: Mutex::new(HashMap::new()),
+            token_side: Mutex::new(HashMap::new()),
+            market_prices: Mutex::new(HashMap::new()),
             last_traded_bucket: Mutex::new(HashMap::new()),
             reconnect_attempts: AtomicBool::new(false),
         }
@@ -93,6 +99,85 @@ impl AppState {
     pub fn unlock_market(&self, market_id: &str) {
         let mut locks = self.in_flight_trades.lock();
         locks.remove(market_id);
+    }
+    
+    /// Build token → side mapping from market list
+    pub fn build_token_mapping(&self, markets: &[(String, String, bool)]) {
+        // markets: (condition_id, token_id, is_yes)
+        let mut mapping = self.token_side.lock();
+        for (cond_id, token_id, is_yes) in markets {
+            mapping.insert(token_id.clone(), (cond_id.clone(), *is_yes));
+        }
+        info!("📊 Token mapping built: {} tokens", mapping.len());
+    }
+    
+    /// Update price for a market from WebSocket update
+    /// Returns (condition_id, yes_price, no_price) if we have both prices
+    pub fn update_market_price(&self, token_id: &str, price: f64) -> Option<(String, f64, f64)> {
+        // First, look up the token info
+        let (condition_id, is_yes) = {
+            let mapping = self.token_side.lock();
+            match mapping.get(token_id) {
+                Some((cid, yes)) => (cid.clone(), *yes),
+                None => return None,
+            }
+        };
+        
+        // Now update the price
+        let combined = {
+            let mut prices = self.market_prices.lock();
+            let entry = prices.entry(condition_id.clone()).or_insert((None, None));
+            
+            if is_yes {
+                entry.0 = Some(price);
+            } else {
+                entry.1 = Some(price);
+            }
+            
+            // Check if we have both
+            match entry {
+                (Some(yes), Some(no)) => Some((yes.clone(), no.clone())),
+                _ => None,
+            }
+        };
+        
+        // If combined exists, return it
+        combined.map(|(yes, no)| (condition_id, yes, no))
+    }
+    
+    /// Get combined price for a market
+    pub fn get_combined(&self, condition_id: &str) -> Option<f64> {
+        let prices = self.market_prices.lock();
+        prices.get(condition_id).and_then(|(yes, no)| {
+            match (yes, no) {
+                (Some(y), Some(n)) => Some(y + n),
+                _ => None,
+            }
+        })
+    }
+    
+    /// Update price using outcome directly (from WebSocket "outcome" field)
+    /// Returns (condition_id, yes_price, no_price) if we have both prices
+    pub fn update_by_outcome(&self, condition_id: &str, price: f64, outcome: &str) -> Option<(String, f64, f64)> {
+        let is_yes = outcome.to_lowercase() == "yes";
+        
+        let combined = {
+            let mut prices = self.market_prices.lock();
+            let entry = prices.entry(condition_id.to_string()).or_insert((None, None));
+            
+            if is_yes {
+                entry.0 = Some(price);
+            } else {
+                entry.1 = Some(price);
+            }
+            
+            match entry {
+                (Some(yes), Some(no)) => Some((yes.clone(), no.clone())),
+                _ => None,
+            }
+        };
+        
+        combined.map(|(yes, no)| (condition_id.to_string(), yes, no))
     }
 
     /// Check if price has moved to a new bucket (noise filtering)
@@ -202,9 +287,11 @@ async fn maintain_ws_connection(
                                 info!("RAW WS #{} len={} : {}", cnt, text.len(), &text[..text.len().min(400)]);
                             }
                             
-                            // Parse orderbook update
-                            if let Ok(update) = parse_orderbook_update(&text) {
-                                let _ = event_tx.send(WsEvent::Update(source, update));
+                            // Parse orderbook updates (one per token in price_changes)
+                            if let Ok(updates) = parse_orderbook_update(&text) {
+                                for update in updates {
+                                    let _ = event_tx.send(WsEvent::Update(source, update));
+                                }
                             }
                         }
                         Ok(Message::Ping(data)) => {
@@ -247,11 +334,12 @@ async fn maintain_ws_connection(
     }
 }
 
-/// Parse orderbook update from JSON
+/// Parse orderbook updates from JSON
+/// Returns one OrderBookUpdate per token in price_changes, or a single update for book snapshots
 /// Handles two message formats:
 /// 1. Full orderbook: [{"event_type":"book","asset_id":"...","market":"...","bids":[...],"asks":[...]}]
-/// 2. Price changes: {"market":"...","price_changes":[{"price":"0.977","asset_id":"...","side":"SELL",...}]}
-fn parse_orderbook_update(text: &str) -> Result<OrderBookUpdate, serde_json::Error> {
+/// 2. Price changes: {"market":"...","price_changes":[{"price":"0.977","asset_id":"...","side":"SELL",...},{"outcome":"NO",...}]}
+fn parse_orderbook_update(text: &str) -> Result<Vec<OrderBookUpdate>, serde_json::Error> {
     let json: serde_json::Value = serde_json::from_str(text)?;
     
     // Message is an array - take first element
@@ -261,13 +349,17 @@ fn parse_orderbook_update(text: &str) -> Result<OrderBookUpdate, serde_json::Err
         &json
     };
     
-    // Extract asset_id (token_id)
+    // Extract asset_id (token_id) - used for book messages
     let token_id = obj["asset_id"].as_str().unwrap_or("").to_string();
     let condition_id = obj["market"].as_str().map(|s| s.to_string()).unwrap_or(token_id.clone());
     
     // Check if this is a price_changes message
     if let Some(price_changes) = obj["price_changes"].as_array() {
-        if let Some(change) = price_changes.first() {
+        // Process ALL price changes
+        // Polymarket sends YES and NO as separate entries in price_changes
+        let mut updates = Vec::new();
+        
+        for change in price_changes.iter() {
             let price = change["price"].as_str()
                 .and_then(|p| p.parse::<f64>().ok())
                 .unwrap_or(0.0);
@@ -275,23 +367,35 @@ fn parse_orderbook_update(text: &str) -> Result<OrderBookUpdate, serde_json::Err
             let size = change["size"].as_str()
                 .and_then(|s| s.parse::<f64>().ok())
                 .unwrap_or(0.0);
+            // Extract outcome from price_changes - Polymarket sends "YES" or "NO"
+            let outcome = change["outcome"].as_str()
+                .map(|s| s.to_lowercase())
+                .unwrap_or_else(|| "yes".to_string());
+            // Get the token_id from this specific price_change entry
+            let change_token_id = change["asset_id"].as_str()
+                .unwrap_or("")
+                .to_string();
             
-            return Ok(OrderBookUpdate {
-                condition_id,
-                token_id,
+            updates.push(OrderBookUpdate {
+                condition_id: condition_id.clone(),
+                token_id: change_token_id,
                 side,
-                outcome: "yes".to_string(),
+                outcome,
                 price,
                 size,
             });
         }
+        
+        // Return all updates
+        if !updates.is_empty() {
+            return Ok(updates);
+        }
     }
     
-    // Get best bid (highest) and best ask (lowest)
+    // Book snapshot - return single update with "yes" as outcome (book doesn't specify)
     let bids = obj["bids"].as_array();
     let asks = obj["asks"].as_array();
     
-    // Use best ask price as the mid-price reference
     let best_ask = asks
         .and_then(|a| a.first())
         .and_then(|l| l["price"].as_str())
@@ -304,9 +408,7 @@ fn parse_orderbook_update(text: &str) -> Result<OrderBookUpdate, serde_json::Err
         .and_then(|p| p.parse::<f64>().ok())
         .unwrap_or(0.0);
     
-    // Determine side and outcome from which book we're looking at
     let side = if best_ask > 0.0 { "sell".to_string() } else { "buy".to_string() };
-    let outcome = "yes".to_string(); // Default - would need more context to determine
     let price = best_ask;
     let size = asks
         .and_then(|a| a.first())
@@ -314,14 +416,14 @@ fn parse_orderbook_update(text: &str) -> Result<OrderBookUpdate, serde_json::Err
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.0);
     
-    Ok(OrderBookUpdate {
+    Ok(vec![OrderBookUpdate {
         condition_id,
         token_id,
         side,
-        outcome,
+        outcome: "yes".to_string(),
         price,
         size,
-    })
+    }])
 }
 
 /// The In-Memory Trading Logic Director
