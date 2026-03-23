@@ -275,6 +275,10 @@ async fn run_websocket_mode(
                         let pseudo_rand = (combined * 1000.0).fract();
                         if pseudo_rand < fill_probability {
                             pnl_tracker.record_fill_success();
+                            
+                            // Record gas cost (Polygon ~$0.003 per tx)
+                            pnl_tracker.record_gas(0.003);
+                            
                             let trade = create_trade_result(
                                 &update.token_id,
                                 &condition_id,

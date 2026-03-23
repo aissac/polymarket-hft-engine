@@ -36,6 +36,7 @@ pub struct PnlState {
     pub losing_shares: f64,
     pub cumulative_pnl: f64,
     pub cumulative_fees: f64,
+    pub cumulative_gas: f64,  // NEW: gas paid
     pub arb_opportunities: u32,
     pub arb_executed: u32,
     // Fill rate tracking
@@ -57,6 +58,7 @@ impl PnlState {
             losing_shares: 0.0,
             cumulative_pnl: 0.0,
             cumulative_fees: 0.0,
+            cumulative_gas: 0.0,
             arb_opportunities: 0,
             arb_executed: 0,
             fills_attempted: 0,
@@ -140,11 +142,19 @@ impl PnlState {
         report.push_str(&format!("Fill Rate:         {:.1}%\n", 
             if self.fills_attempted > 0 { (self.fills_succeeded as f64 / self.fills_attempted as f64) * 100.0 } else { 0.0 }));
         
+        report.push_str("\n");
+        
+        report.push_str("⛽ GAS COSTS\n");
+        report.push_str("─────────────────────────────────────\n");
+        report.push_str(&format!("Gas Paid:         ${:.4}\n", self.cumulative_gas));
+        report.push_str(&format!("Net Profit:       ${:.4}\n", self.cumulative_pnl - self.cumulative_fees - self.cumulative_gas));
+        
         report.push_str("\n═══════════════════════════════════════\n");
         
         // Emoji indicator
-        let emoji = if self.cumulative_pnl > 0.0 { "🟢" } else if self.cumulative_pnl < 0.0 { "🔴" } else { "⚪" };
-        report.push_str(&format!("NET PNL: {} ${:.4}\n", emoji, self.cumulative_pnl));
+        let net = self.cumulative_pnl - self.cumulative_fees - self.cumulative_gas;
+        let emoji = if net > 0.0 { "🟢" } else if net < 0.0 { "🔴" } else { "⚪" };
+        report.push_str(&format!("NET PNL: {} ${:.4} (after fees & gas)\n", emoji, net));
         report.push_str("═══════════════════════════════════════\n");
         
         report
@@ -291,6 +301,12 @@ impl PnlTracker {
         s.fills_failed += 1;
     }
     
+    /// Record gas cost for a trade (Polygon is ~$0.002-0.005 per tx)
+    pub fn record_gas(&self, gas_cost: f64) {
+        let mut s = self.state.lock();
+        s.cumulative_gas += gas_cost;
+    }
+    
     /// Get fill rate as percentage
     pub fn get_fill_rate(&self) -> f64 {
         let s = self.state.lock();
@@ -310,6 +326,7 @@ impl PnlTracker {
             losing_shares: s.losing_shares,
             cumulative_pnl: s.cumulative_pnl,
             cumulative_fees: s.cumulative_fees,
+            cumulative_gas: s.cumulative_gas,
             arb_opportunities: s.arb_opportunities,
             arb_executed: s.arb_executed,
             fills_attempted: s.fills_attempted,
