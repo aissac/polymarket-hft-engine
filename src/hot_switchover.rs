@@ -248,7 +248,9 @@ async fn maintain_ws_connection(
 }
 
 /// Parse orderbook update from JSON
-/// Message format: [{"event_type":"book","asset_id":"...","market":"...","bids":[...],"asks":[...]}]
+/// Handles two message formats:
+/// 1. Full orderbook: [{"event_type":"book","asset_id":"...","market":"...","bids":[...],"asks":[...]}]
+/// 2. Price changes: {"market":"...","price_changes":[{"price":"0.977","asset_id":"...","side":"SELL",...}]}
 fn parse_orderbook_update(text: &str) -> Result<OrderBookUpdate, serde_json::Error> {
     let json: serde_json::Value = serde_json::from_str(text)?;
     
@@ -262,6 +264,28 @@ fn parse_orderbook_update(text: &str) -> Result<OrderBookUpdate, serde_json::Err
     // Extract asset_id (token_id)
     let token_id = obj["asset_id"].as_str().unwrap_or("").to_string();
     let condition_id = obj["market"].as_str().map(|s| s.to_string()).unwrap_or(token_id.clone());
+    
+    // Check if this is a price_changes message
+    if let Some(price_changes) = obj["price_changes"].as_array() {
+        if let Some(change) = price_changes.first() {
+            let price = change["price"].as_str()
+                .and_then(|p| p.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            let side = change["side"].as_str().unwrap_or("").to_string();
+            let size = change["size"].as_str()
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            
+            return Ok(OrderBookUpdate {
+                condition_id,
+                token_id,
+                side,
+                outcome: "yes".to_string(),
+                price,
+                size,
+            });
+        }
+    }
     
     // Get best bid (highest) and best ask (lowest)
     let bids = obj["bids"].as_array();
