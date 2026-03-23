@@ -258,6 +258,23 @@ async fn run_websocket_mode(
                             combined,
                             edge * 100.0
                         );
+                        
+                        // Calculate profit for minimum trade check
+                        // Set minimum to $0.20 net profit (realistic for 100 shares with decent edge)
+                        // net = (1-comb) - comb*0.02 - 0.003 >= 0.20
+                        // Solving: comb <= (1 - 0.20 - 0.003) / 1.02 = 0.777/1.02 ≈ 0.762
+                        // So combined <= $0.76 gives $0.20+ net profit (18%+ edge)
+                        
+                        let gross_profit = 1.0 - combined - (combined * 0.02);
+                        let net_profit = gross_profit - 0.003;
+                        
+                        // Only execute if net profit >= $0.20 minimum
+                        if net_profit < 0.20 {
+                            // Below minimum trade value - skip
+                            continue;
+                        }
+                        
+                        // Now record attempt since we're above minimum
                         pnl_tracker.record_arb_opportunity();
                         pnl_tracker.record_fill_attempt();
                         
@@ -274,6 +291,7 @@ async fn run_websocket_mode(
                         // In dry run, simulate fill success/failure based on edge
                         // Use combined price digits as pseudo-random
                         let pseudo_rand = (combined * 1000.0).fract();
+                        
                         if pseudo_rand < fill_probability {
                             pnl_tracker.record_fill_success();
                             
