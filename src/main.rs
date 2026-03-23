@@ -261,6 +261,11 @@ async fn run_websocket_mode(
                             ob.get(&condition_id).map(|u| u.size).unwrap_or(0.0)
                         };
 
+                        // Skip if liquidity < 200 shares (filter fake edges)
+                        if orderbook_size < 200.0 {
+                            continue;
+                        }
+
                         info!(
                             "🎯 SWEET SPOT ARB! | {} | YES: ${:.4} + NO: ${:.4} = ${:.4} | Edge: {:.1}% | Size: {:.0}",
                             &condition_id[..8.min(condition_id.len())],
