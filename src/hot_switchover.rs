@@ -51,6 +51,35 @@ pub struct AppState {
     pub last_traded_bucket: Mutex<HashMap<String, u64>>,
     /// Number of consecutive reconnect failures
     pub reconnect_attempts: AtomicBool,
+    
+    // ═══════════════════════════════════════════════════════════════
+    // RISK MANAGEMENT - Added based on NotebookLM recommendations
+    // ═══════════════════════════════════════════════════════════════
+    
+    /// Inventory skew: total YES vs NO shares (for delta-neutral)
+    pub inventory_skew: Mutex<(i32, i32)>, // (yes_shares, no_shares)
+    /// Max inventory skew before forcing rebalance (e.g., 200 shares)
+    pub max_skew: i32,
+    /// Track Leg 1 fill time for stop-loss (condition_id → fill_timestamp)
+    pub leg1_fill_time: Mutex<HashMap<String, std::time::Instant>>,
+    /// Max wait time for Leg 2 after Leg 1 fills (5 minutes = 300 seconds)
+    pub max_leg2_wait_secs: u64,
+    /// Velocity lockout: track recent price changes per condition
+    pub price_history: Mutex<HashMap<String, Vec<(std::time::Instant, f64)>>>, // (timestamp, price)
+    /// Velocity threshold: if price moves > X% in Y seconds, lockout
+    pub velocity_lockout_secs: u64,
+    pub velocity_threshold_pct: f64,
+    /// Pause trading for this many seconds after velocity lockout
+    pub velocity_pause_secs: u64,
+    /// Last velocity lockout time
+    pub last_velocity_lockout: Mutex<Option<std::time::Instant>>,
+    /// Volatility filter: ATR-like calculation
+    pub atr_history: Mutex<HashMap<String, Vec<f64>>>, // Recent ranges per condition
+    /// Min ATR required to trade (low volatility = no momentum = bad)
+    pub min_atr: f64,
+    /// Daily loss tracking for drawdown limit
+    pub daily_loss: Mutex<f64>,
+    pub max_daily_loss: f64,
 }
 
 impl AppState {
@@ -63,6 +92,21 @@ impl AppState {
             market_prices: Mutex::new(HashMap::new()),
             last_traded_bucket: Mutex::new(HashMap::new()),
             reconnect_attempts: AtomicBool::new(false),
+            
+            // Risk management initialization
+            inventory_skew: Mutex::new((0, 0)),
+            max_skew: 200, // Max 200 share imbalance before rebalance
+            leg1_fill_time: Mutex::new(HashMap::new()),
+            max_leg2_wait_secs: 300, // 5 minutes to get Leg 2
+            price_history: Mutex::new(HashMap::new()),
+            velocity_lockout_secs: 10, // Lockout for 10 seconds
+            velocity_threshold_pct: 0.05, // 5% price move triggers lockout
+            velocity_pause_secs: 30, // Pause trading for 30 seconds after velocity
+            last_velocity_lockout: Mutex::new(None),
+            atr_history: Mutex::new(HashMap::new()),
+            min_atr: 0.01, // Min 1% ATR to trade (low vol = no momentum)
+            daily_loss: Mutex::new(0.0),
+            max_daily_loss: 50.0, // Max $50 daily loss before pause
         }
     }
 
@@ -99,6 +143,168 @@ impl AppState {
     pub fn unlock_market(&self, market_id: &str) {
         let mut locks = self.in_flight_trades.lock();
         locks.remove(market_id);
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // RISK MANAGEMENT METHODS
+    // ═══════════════════════════════════════════════════════════════════
+    
+    /// Check velocity lockout - returns true if too fast, should not trade
+    pub fn check_velocity_lockout(&self, condition_id: &str) -> bool {
+        // Check if we're in a velocity lockout period
+        let last_lockout_guard = self.last_velocity_lockout.lock();
+        let last_lockout = last_lockout_guard.unwrap_or_else(|| {
+            std::time::Instant::now() - std::time::Duration::new(3600, 0)
+        });
+        if last_lockout.elapsed().as_secs() < self.velocity_lockout_secs {
+            warn!("⚡ VELOCITY LOCKOUT: Paused for {} more seconds", self.velocity_lockout_secs - last_lockout.elapsed().as_secs());
+            return true;
+        }
+        drop(last_lockout_guard);
+        
+        // Check price history for velocity
+        let mut history = self.price_history.lock();
+        let now = std::time::Instant::now();
+        
+        // Clean old entries (older than 60 seconds)
+        if let Some(prices) = history.get_mut(condition_id) {
+            prices.retain(|(t, _)| now.duration_since(*t).as_secs() < 60);
+            
+            // Check for rapid price movement
+            if prices.len() >= 3 {
+                let recent = &prices[prices.len().saturating_sub(3)..];
+                if let (Some((_, p1)), Some((_, p2))) = (recent.first(), recent.last()) {
+                    let change_pct = (p1 - p2).abs() / p2;
+                    if change_pct > self.velocity_threshold_pct {
+                        let secs = recent.last().unwrap().0.elapsed().as_secs();
+                        if secs < self.velocity_lockout_secs as u64 {
+                            warn!("⚡ VELOCITY DETECTED: {:.1}% change in {}s - LOCKOUT for {}s", 
+                                change_pct * 100.0, secs, self.velocity_pause_secs);
+                            *self.last_velocity_lockout.lock() = Some(now);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Record current price
+        let prices = history.entry(condition_id.to_string()).or_insert_with(Vec::new);
+        if let Some((_, last_price)) = prices.last() {
+            prices.push((now, *last_price));
+        }
+        
+        false
+    }
+    
+    /// Record price for velocity tracking
+    pub fn record_price(&self, condition_id: &str, price: f64) {
+        let mut history = self.price_history.lock();
+        let now = std::time::Instant::now();
+        let prices = history.entry(condition_id.to_string()).or_insert_with(Vec::new);
+        prices.push((now, price));
+        // Keep only last 100 prices
+        if prices.len() > 100 {
+            prices.drain(0..prices.len() - 100);
+        }
+    }
+    
+    /// Check volatility (ATR-like) - returns true if market is too calm to trade
+    pub fn check_volatility(&self, condition_id: &str) -> bool {
+        let history = self.atr_history.lock();
+        if let Some(ranges) = history.get(condition_id) {
+            if ranges.len() >= 5 {
+                let avg_range: f64 = ranges.iter().rev().take(5).sum::<f64>() / 5.0;
+                if avg_range < self.min_atr {
+                    debug!("🌊 LOW VOLATILITY: ATR {:.4} < {:.4} min - skipping", avg_range, self.min_atr);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    
+    /// Record range for ATR calculation
+    pub fn record_range(&self, condition_id: &str, range: f64) {
+        let mut history = self.atr_history.lock();
+        let ranges = history.entry(condition_id.to_string()).or_insert_with(Vec::new);
+        ranges.push(range);
+        if ranges.len() > 20 {
+            ranges.drain(0..ranges.len() - 20);
+        }
+    }
+    
+    /// Check inventory skew - returns true if too imbalanced
+    pub fn check_inventory_skew(&self) -> bool {
+        let skew_guard = self.inventory_skew.lock();
+        let (yes, no) = (*skew_guard);
+        let imbalance = (yes - no).abs();
+        if imbalance > self.max_skew {
+            warn!("📊 INVENTORY SKEW: YES={}, NO={}, imbalance={} > {} - forcing rebalance", 
+                yes, no, imbalance, self.max_skew);
+            return true;
+        }
+        false
+    }
+    
+    /// Record inventory change
+    pub fn record_inventory(&self, yes_delta: i32, no_delta: i32) {
+        let mut skew = self.inventory_skew.lock();
+        skew.0 += yes_delta;
+        skew.1 += no_delta;
+        debug!("📊 INVENTORY: YES={}, NO={}", skew.0, skew.1);
+    }
+    
+    /// Record Leg 1 fill time for stop-loss
+    pub fn record_leg1_fill(&self, condition_id: String) {
+        let mut fill_times = self.leg1_fill_time.lock();
+        fill_times.insert(condition_id, std::time::Instant::now());
+    }
+    
+    /// Check if Leg 2 is overdue (stop-loss trigger)
+    pub fn is_leg2_overdue(&self, condition_id: &str) -> bool {
+        let fill_times = self.leg1_fill_time.lock();
+        if let Some(fill_time) = fill_times.get(condition_id) {
+            let elapsed = fill_time.elapsed().as_secs();
+            if elapsed > self.max_leg2_wait_secs {
+                warn!("⏰ LEG2 TIMEOUT: {} seconds > {} max - TRIGGER STOP-LOSS", 
+                    elapsed, self.max_leg2_wait_secs);
+                return true;
+            }
+        }
+        false
+    }
+    
+    /// Clear leg1 fill time after hedge completes
+    pub fn clear_leg1_fill(&self, condition_id: &str) {
+        let mut fill_times = self.leg1_fill_time.lock();
+        fill_times.remove(condition_id);
+    }
+    
+    /// Check daily drawdown limit
+    pub fn check_drawdown_limit(&self) -> bool {
+        let loss_guard = self.daily_loss.lock();
+        let loss = *loss_guard;
+        if loss >= self.max_daily_loss {
+            warn!("💰 DRAWDOWN LIMIT: ${:.2} >= ${:.2} max - PAUSING TRADING", 
+                loss, self.max_daily_loss);
+            return true;
+        }
+        false
+    }
+    
+    /// Record a loss for daily tracking
+    pub fn record_loss(&self, amount: f64) {
+        let mut loss = self.daily_loss.lock();
+        *loss += amount;
+        info!("💰 Daily loss: ${:.2} / ${:.2}", *loss, self.max_daily_loss);
+    }
+    
+    /// Reset daily loss (call at start of new day)
+    pub fn reset_daily_loss(&self) {
+        let mut loss = self.daily_loss.lock();
+        *loss = 0.0;
+        info!("💰 Daily loss reset to $0.00");
     }
     
     /// Build token → side mapping from market list

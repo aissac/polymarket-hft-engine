@@ -6,7 +6,7 @@
 use std::env;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{info, warn, Level};
+use tracing::{info, warn, debug, Level};
 use tracing_subscriber::FmtSubscriber;
 use chrono::Local;
 
@@ -263,6 +263,34 @@ async fn run_websocket_mode(
 
                         // Skip if liquidity < 200 shares (filter fake edges)
                         if orderbook_size < 200.0 {
+                            continue;
+                        }
+                        
+                        // ═══════════════════════════════════════════════════════
+                        // RISK MANAGEMENT CHECKS (NotebookLM recommendations)
+                        // ═══════════════════════════════════════════════════════
+                        
+                        // 1. VELOCITY LOCKOUT - Don't trade if price moving too fast
+                        if state.check_velocity_lockout(&condition_id) {
+                            debug!("⏸️  Skipping due to velocity lockout: {}", &condition_id[..8.min(condition_id.len())]);
+                            continue;
+                        }
+                        
+                        // 2. VOLATILITY FILTER - Only trade in moving markets
+                        if state.check_volatility(&condition_id) {
+                            continue;
+                        }
+                        
+                        // 3. INVENTORY SKEW - Don't get too imbalanced
+                        if state.check_inventory_skew() {
+                            info!("⚠️  Skipping trade due to inventory imbalance");
+                            continue;
+                        }
+                        
+                        // 4. DRAWDOWN LIMIT - Stop if losing too much today
+                        if state.check_drawdown_limit() {
+                            warn!("🚨 DRAWDOWN LIMIT REACHED - Trading paused for safety");
+                            state.halt_trading();
                             continue;
                         }
 
