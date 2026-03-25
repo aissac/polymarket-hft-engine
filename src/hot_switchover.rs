@@ -80,6 +80,8 @@ pub struct AppState {
     /// Daily loss tracking for drawdown limit
     pub daily_loss: Mutex<f64>,
     pub max_daily_loss: f64,
+    /// Polyfill-rs fast orderbook processor (SIMD parsing)
+    pub fast_processor: Option<FastOrderBookProcessor>,
 }
 
 impl AppState {
@@ -107,7 +109,15 @@ impl AppState {
             min_atr: 0.01, // Min 1% ATR to trade (low vol = no momentum)
             daily_loss: Mutex::new(0.0),
             max_daily_loss: 50.0, // Max $50 daily loss before pause
+            fast_processor: None,
         }
+    }
+    /// Initialize polyfill-rs FastOrderBookProcessor for SIMD parsing
+    pub fn with_fast_processor(mut self) -> Self {
+        info!("⚡ Initializing polyfill-rs FastOrderBookProcessor...");
+        self.fast_processor = Some(FastOrderBookProcessor::new(100));
+        info!("⚡ FastOrderBookProcessor ready for SIMD parsing");
+        self
     }
 
     /// Halt all trading - call on disconnect

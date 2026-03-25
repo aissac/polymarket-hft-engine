@@ -185,7 +185,7 @@ async fn run_websocket_mode(
     }
     
     // Create shared application state
-    let state = Arc::new(AppState::new());
+    let state = Arc::new(AppState::new().with_fast_processor());
     state.build_token_mapping(&token_mapping);
     
     // Create channel for director to send updates
