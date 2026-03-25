@@ -794,3 +794,64 @@ impl AppState {
         None
     }
 }
+
+// =============================================================================
+// POLYFILL-RS: SIMD-Accelerated WebSocket Parsing (0.28µs hot path)
+// =============================================================================
+
+use polyfill_rs::{OrderBookManager, WsBookUpdateProcessor};
+
+/// Fast orderbook processor using polyfill-rs SIMD parsing
+pub struct FastOrderBookProcessor {
+    manager: OrderBookManager,
+    processor: WsBookUpdateProcessor,
+}
+
+impl FastOrderBookProcessor {
+    pub fn new(levels: usize) -> Self {
+        Self {
+            manager: OrderBookManager::new(levels),
+            processor: WsBookUpdateProcessor::new(4096),
+        }
+    }
+    
+    /// Process WebSocket message with SIMD acceleration
+    /// Returns (book_messages_processed, levels_applied)
+    pub fn process(&mut self, text: String) -> anyhow::Result<(usize, usize)> {
+        let stats = self.processor.process_text(text, &self.manager)?;
+        Ok((stats.book_messages, stats.book_levels_applied))
+    }
+    
+    /// Get best prices for a condition_id
+    pub fn get_best_prices(&self, condition_id: &str) -> Option<(f64, f64)> {
+        self.manager.get_book(condition_id).ok().map(|book| {
+            let yes_ask = book.asks.first()
+                .and_then(|l| l.price.to_string().parse::<f64>().ok())
+                .unwrap_or(0.0);
+            let no_bid = book.bids.first()
+                .and_then(|l| l.price.to_string().parse::<f64>().ok())
+                .unwrap_or(0.0);
+            (yes_ask, no_bid)
+        })
+    }
+    
+    /// Get top-of-book size for liquidity check
+    pub fn get_top_size(&self, condition_id: &str) -> f64 {
+        self.manager.get_book(condition_id).ok()
+            .map(|book| {
+                let yes_size: f64 = book.asks.iter()
+                    .map(|l| l.size.to_string().parse::<f64>().unwrap_or(0.0))
+                    .sum();
+                let no_size: f64 = book.bids.iter()
+                    .map(|l| l.size.to_string().parse::<f64>().unwrap_or(0.0))
+                    .sum();
+                yes_size.max(no_size)
+            })
+            .unwrap_or(0.0)
+    }
+    
+    /// Get underlying manager for advanced use
+    pub fn manager(&self) -> &OrderBookManager {
+        &self.manager
+    }
+}

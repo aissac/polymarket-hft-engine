@@ -8,6 +8,7 @@ mod api;
 mod strategy;
 mod trading;
 mod websocket;
+mod polyfill_integration;
 pub mod production;
 
 pub use orderbook::OrderBookTracker;
