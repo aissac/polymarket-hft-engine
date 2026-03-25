@@ -46,3 +46,4 @@ secrecy = "0.8"
 # Rust decimal for precise pricing
 rust_decimal = { version = "1.33", features = ["serde"] }
 rust_decimal_macros = "1.33"
+polyfill-rs = "0.3.1"

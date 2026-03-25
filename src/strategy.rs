@@ -165,6 +165,9 @@ impl PingpongStrategy {
                                     let signal = ArbitrageSignal {
                                         market: market.clone(),
                                         profit: edge,
+                                        size: 100.0,
+                                        yes_depth: 200.0,
+                                        no_depth: 200.0,
                                     };
                                     if let Err(e) = tx.send(signal) {
                                         warn!("Failed to send trading signal: {}", e);

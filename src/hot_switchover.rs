@@ -40,7 +40,7 @@ pub struct AppState {
     /// Trading halt/resume flag - set true on disconnect
     pub risk_paused: AtomicBool,
     /// Prevents multiple trades firing for same market simultaneously
-    pub in_flight_trades: Mutex<HashSet<String>>,
+    pub in_flight_trades: Mutex<HashMap<String, std::time::Instant>>,
     /// Local orderbook state
     pub orderbook: Mutex<HashMap<String, OrderBookUpdate>>,
     /// Token to side mapping: token_id → (condition_id, is_yes)
@@ -86,7 +86,7 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             risk_paused: AtomicBool::new(true), // Paused until first WS connects
-            in_flight_trades: Mutex::new(HashSet::new()),
+            in_flight_trades: Mutex::new(HashMap::new()),
             orderbook: Mutex::new(HashMap::new()),
             token_side: Mutex::new(HashMap::new()),
             market_prices: Mutex::new(HashMap::new()),
@@ -129,14 +129,25 @@ impl AppState {
     }
 
     /// Try to lock a market for trading (prevents duplicate orders)
-    pub fn try_lock_market(&self, market_id: &str) -> bool {
+    /// Returns lock token if successful, None if already locked
+    pub fn try_lock_market(&self, market_id: &str) -> Option<std::time::Instant> {
         let mut locks = self.in_flight_trades.lock();
-        if locks.contains(market_id) {
-            false // Already trading this market
+        if locks.contains_key(market_id) {
+            None // Already trading this market
         } else {
-            locks.insert(market_id.to_string());
-            true
+            let lock_time = std::time::Instant::now();
+            locks.insert(market_id.to_string(), lock_time);
+            Some(lock_time)
         }
+    }
+
+    /// Check and cleanup expired locks (auto-unlock after TTL)
+    pub fn cleanup_expired_locks(&self, ttl_secs: u64) {
+        let mut locks = self.in_flight_trades.lock();
+        let now = std::time::Instant::now();
+        locks.retain(|_key, lock_time| {
+            now.duration_since(*lock_time).as_secs() < ttl_secs
+        });
     }
 
     /// Unlock a market after trading completes
@@ -753,10 +764,10 @@ mod tests {
     fn test_market_locking() {
         let state = AppState::new();
         
-        assert!(state.try_lock_market("market1"));
-        assert!(!state.try_lock_market("market1")); // Already locked
+        assert!(state.try_lock_market("market1").is_some());
+        assert!(state.try_lock_market("market1").is_none()); // Already locked
         state.unlock_market("market1");
-        assert!(state.try_lock_market("market1")); // Now unlocked
+        assert!(state.try_lock_market("market1").is_some()); // Now unlocked
     }
     
     #[test]
@@ -768,5 +779,18 @@ mod tests {
         assert!(state.is_new_bucket("BTC", 0.502));
         assert!(state.is_new_bucket("BTC", 0.502)); // Same bucket - false
         assert!(state.is_new_bucket("BTC", 0.511)); // New bucket
+    }
+}
+
+/// Get the NO token ID for a condition
+impl AppState {
+    pub fn get_no_token_id(&self, condition_id: &str) -> Option<String> {
+        let mapping = self.token_side.lock();
+        for (token_id, (cond_id, is_yes)) in mapping.iter() {
+            if cond_id == condition_id && !is_yes {
+                return Some(token_id.clone());
+            }
+        }
+        None
     }
 }

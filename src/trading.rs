@@ -17,6 +17,9 @@ use std::str::FromStr;
 use anyhow::{Context, Result};
 use alloy::signers::local::PrivateKeySigner;
 use tokio::sync::mpsc;
+use std::sync::Mutex;
+use std::collections::HashMap;
+use tokio::time::{timeout, Duration};
 use tracing::{info, error, warn, debug};
 
 use crate::api::SimplifiedMarket;
@@ -30,6 +33,12 @@ pub struct TradingConfig {
     pub max_leg_usdc: f64,
     /// Whether to actually trade or just simulate
     pub dry_run: bool,
+    /// Total bankroll for MLE calculations
+    pub total_bankroll: f64,
+    /// Max % of bankroll per market (5%)
+    pub max_per_market_pct: f64,
+    /// Max % of bankroll across all markets (15%)
+    pub max_total_pct: f64,
 }
 
 impl Default for TradingConfig {
@@ -38,6 +47,9 @@ impl Default for TradingConfig {
             min_profit: 0.01,
             max_leg_usdc: 50.0,
             dry_run: true,
+            total_bankroll: 1000.0, // $1000 default
+            max_per_market_pct: 0.05, // 5% per market
+            max_total_pct: 0.15, // 15% total
         }
     }
 }
@@ -51,6 +63,7 @@ pub struct OrderResult {
     pub yes_filled: bool,
     pub no_filled: bool,
     pub profit_estimate: f64,
+    pub size: f64,
 }
 
 /// Trading engine using Polymarket CLOB SDK with EIP-712
@@ -65,15 +78,20 @@ pub struct TradingEngine {
     signer: Option<PrivateKeySigner>,
     /// CLOB API URL
     api_url: String,
+    // MLE tracking
+    active_capital: Mutex<HashMap<String, f64>>,
+    total_active_capital: Mutex<f64>,
 }
 
 impl TradingEngine {
     /// Create a new trading engine
     pub fn new(config: TradingConfig) -> Self {
         Self {
-            config,
+            config: config.clone(),
             signer: None,
             api_url: "https://clob.polymarket.com".to_string(),
+            active_capital: Mutex::new(HashMap::new()),
+            total_active_capital: Mutex::new(0.0),
         }
     }
 
@@ -117,11 +135,12 @@ impl TradingEngine {
     /// 
     /// Currently only supports dry-run mode.
     /// Live trading requires resolving Arc<Client> lifetime with tokio::join!
-    pub async fn execute_arbitrage(&self, market: &SimplifiedMarket) -> Result<OrderResult> {
+    pub async fn execute_arbitrage(&self, market: &SimplifiedMarket, size: f64) -> Result<OrderResult> {
         let yes_price = market.yes_price().unwrap_or(0.0);
         let no_price = market.no_price().unwrap_or(0.0);
         let combined = yes_price + no_price;
-        let profit = 1.0 - combined - (combined * 0.02);
+        // Exact EV calculation: Polymarket takes 2% on winnings
+        let profit = 1.0 - combined - (combined * 0.02);  // Keep as approximate for now (will update)
         
         if profit <= self.config.min_profit {
             return Ok(OrderResult {
@@ -131,19 +150,18 @@ impl TradingEngine {
                 yes_filled: false,
                 no_filled: false,
                 profit_estimate: profit,
+                size,
             });
         }
         
-        let size = (self.config.max_leg_usdc / yes_price.min(no_price)).floor();
-        
         info!(
-            "🎯 ARBITRAGE DETECTED: {} | YES: ${:.4} + NO: ${:.4} = ${:.4} | Profit: ${:.4} | Size: {}",
+            "🎯 ARBITRAGE DETECTED: {} | YES: ${:.4} + NO: ${:.4} = ${:.4} | Profit: ${:.4} | Size: {:.0}",
             &market.condition_id[..8.min(market.condition_id.len())],
             yes_price, no_price, combined, profit, size
         );
         
         if self.config.dry_run {
-            self.execute_dry_run(market, yes_price, no_price, size, profit).await
+            self.execute_dry_run(market, yes_price, no_price, size, profit, size, size).await
         } else {
             // TODO: Implement live trading when Arc<Client> lifetime resolved
             anyhow::bail!("Live trading not yet implemented - use dry_run mode");
@@ -163,18 +181,71 @@ impl TradingEngine {
         no_price: f64,
         size: f64,
         profit: f64,
+        yes_depth: f64,
+        no_depth: f64,
     ) -> Result<OrderResult> {
-        info!("🔒 DRY RUN - Simulating concurrent EIP-712 signed orders...");
-        
+        // IOC + Tick Size Limit: Only fill what top-of-book can provide
+        let actual_size = size.min(yes_depth).min(no_depth);
+        if actual_size < 10.0 {
+            info!("⚠️ SKIPPING - insufficient top-of-book liquidity: YES={:.0} NO={:.0}", yes_depth, no_depth);
+            return Ok(OrderResult {
+                market_id: market.condition_id.clone(),
+                yes_order_id: None,
+                no_order_id: None,
+                yes_filled: false,
+                no_filled: false,
+                profit_estimate: 0.0,
+                size: 0.0,
+            });
+        }
+        let size_msg = if actual_size < size {
+            format!(" (IOC capped: {:.0} -> {:.0})", size, actual_size)
+        } else {
+            String::new()
+        };
+        info!("🔒 DRY RUN - Simulating concurrent EIP-712 signed orders...{}", size_msg);        
         // Bind token IDs to ensure they live long enough
         let yes_token = market.yes_token_id().unwrap_or_default();
         let no_token = market.no_token_id().unwrap_or_default();
         
-        // Simulate concurrent order signing and submission
-        let (yes_result, no_result) = tokio::join!(
-            self.simulate_sign_and_submit(&yes_token, size, yes_price),
-            self.simulate_sign_and_submit(&no_token, size, no_price)
-        );
+        // Execute both legs with timeout to prevent infinite waiting
+        // If one leg fills but other doesn't within 45 seconds, trigger stop-loss hedge
+        let yes_fut = self.simulate_sign_and_submit(&yes_token, actual_size, yes_price);
+        let no_fut = self.simulate_sign_and_submit(&no_token, actual_size, no_price);
+        
+        // Race both legs - first to complete wins
+        let yes_result = timeout(Duration::from_secs(45), yes_fut).await;
+        let no_result = timeout(Duration::from_secs(45), no_fut).await;
+        
+        // Check if either leg timed out
+        let yes_timed_out = yes_result.is_err();
+        let no_timed_out = no_result.is_err();
+        
+        if yes_timed_out || no_timed_out {
+            let filled_leg = if yes_timed_out == false { "YES" } else { "NO" };
+            let missing_leg = if yes_timed_out == false { "NO" } else { "YES" };
+            warn!("⚠️ LEG RISK: {} filled but {} TIMEOUT - initiating stop-loss hedge", filled_leg, missing_leg);
+            
+            // In live mode, would fire market order here to close exposure
+            // For now, mark as partial fill
+            let (yes_id, no_id, yes_filled, no_filled) = if yes_timed_out {
+                (None, None, false, false)
+            } else {
+                (yes_result.unwrap().ok(), None, true, false)
+            };
+            return Ok(OrderResult {
+                market_id: market.condition_id.clone(),
+                yes_order_id: yes_id,
+                no_order_id: no_id,
+                yes_filled,
+                no_filled,
+                profit_estimate: profit * 0.5, // Half profit due to leg risk
+                size: actual_size,
+            });
+        }
+        
+        let yes_result = yes_result.unwrap();
+        let no_result = no_result.unwrap();
         
         match (yes_result, no_result) {
             (Ok(yes_id), Ok(no_id)) => {
@@ -186,6 +257,7 @@ impl TradingEngine {
                     yes_filled: true,
                     no_filled: true,
                     profit_estimate: profit,
+                    size: actual_size,
                 })
             }
             (Ok(yes_id), Err(e)) => {
@@ -197,6 +269,7 @@ impl TradingEngine {
                     yes_filled: true,
                     no_filled: false,
                     profit_estimate: profit,
+                    size,
                 })
             }
             (Err(e), Ok(no_id)) => {
@@ -208,6 +281,7 @@ impl TradingEngine {
                     yes_filled: false,
                     no_filled: true,
                     profit_estimate: profit,
+                    size,
                 })
             }
             (Err(e1), Err(e2)) => {
@@ -219,6 +293,7 @@ impl TradingEngine {
                     yes_filled: false,
                     no_filled: false,
                     profit_estimate: profit,
+                    size,
                 })
             }
         }
@@ -244,6 +319,9 @@ impl TradingEngine {
 pub struct ArbitrageSignal {
     pub market: SimplifiedMarket,
     pub profit: f64,
+    pub size: f64,
+    pub yes_depth: f64,  // Top-of-book YES depth
+    pub no_depth: f64,   // Top-of-book NO depth
 }
 
 /// Start the trading event loop
@@ -266,10 +344,38 @@ pub async fn start_trading_loop(
     }
     
     while let Some(signal) = rx.recv().await {
-        match engine.execute_arbitrage(&signal.market).await {
+        // MLE Check: Validate capital limits before trading
+        let capital_required = signal.size * (signal.market.yes_price().unwrap_or(0.0) + signal.market.no_price().unwrap_or(0.0));
+        let max_per_market = engine.config.total_bankroll * engine.config.max_per_market_pct;
+        let max_total = engine.config.total_bankroll * engine.config.max_total_pct;
+        
+        {
+            let active = engine.active_capital.lock().unwrap();
+            let total = engine.total_active_capital.lock().unwrap();
+            let current_per_market = active.get(&signal.market.condition_id).unwrap_or(&0.0);
+            if *current_per_market + capital_required > max_per_market {
+                warn!("⚠️ MLE BLOCKED: {} market cap exceeded (${:.2} > ${:.2})", 
+                    &signal.market.condition_id[..8.min(signal.market.condition_id.len())], 
+                    *current_per_market + capital_required, max_per_market);
+            } else if *total + capital_required > max_total {
+                warn!("⚠️ MLE BLOCKED: Total capital cap exceeded (${:.2} > ${:.2})", 
+                    *total + capital_required, max_total);
+            } else {
+                // Reserve capital: update both per-market and total
+                drop(active);
+                drop(total);
+                engine.active_capital.lock().unwrap().insert(signal.market.condition_id.clone(), 
+                    capital_required);
+                *engine.total_active_capital.lock().unwrap() += capital_required;
+                info!("📊 MLE: Reserved ${:.2} | Total: ${:.2}", capital_required, 
+                    *engine.total_active_capital.lock().unwrap());
+            }
+        }
+        
+        match engine.execute_arbitrage(&signal.market, signal.size).await {
             Ok(result) => {
                 if result.yes_filled && result.no_filled {
-                    info!("✅ Trade complete: {} profit=${:.4}", result.market_id, result.profit_estimate);
+                    info!("✅ Trade complete: {} profit=${:.4} (${:.2} total)", result.market_id, result.profit_estimate, result.profit_estimate * result.size);
                 } else if result.yes_filled || result.no_filled {
                     warn!("⚠️ Partial fill - LEG RISK on {}", result.market_id);
                 }

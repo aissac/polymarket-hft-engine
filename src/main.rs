@@ -6,7 +6,7 @@
 use std::env;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{info, warn, debug, Level};
+use tracing::{info, warn, debug, Level, error};
 use tracing_subscriber::FmtSubscriber;
 use chrono::Local;
 
@@ -19,7 +19,8 @@ mod hot_switchover;
 mod pnl;
 mod gabagool_strategy;
 
-use api::PolyClient;
+use api::{PolyClient, SimplifiedMarket};
+use websocket::TokenData;
 use orderbook::OrderBookTracker;
 use strategy::{PingpongStrategy, StrategyEvent};
 use trading::{TradingEngine, TradingConfig, start_trading_loop, ArbitrageSignal};
@@ -91,6 +92,9 @@ async fn main() -> anyhow::Result<()> {
         dry_run,
         min_profit: 0.01,
         max_leg_usdc: 50.0,
+        total_bankroll: 1000.0, // $1000 bankroll
+        max_per_market_pct: 0.05, // 5% per market
+        max_total_pct: 0.15, // 15% total
     };
     let mut engine = TradingEngine::new(trading_config);
     
@@ -104,11 +108,12 @@ async fn main() -> anyhow::Result<()> {
     }
     
     // Start trading loop
+    let trading_tx = trading_tx.clone(); // Clone for use in websocket mode
     let _trading_handle = tokio::spawn(start_trading_loop(engine, trading_rx));
     
     if use_websocket {
         // Phase 3.6: Hot Switchover WebSocket mode with PnL tracking
-        run_websocket_mode(api.clone(), strategy_tx, pnl_tracker).await?;
+        run_websocket_mode(api.clone(), strategy_tx, pnl_tracker, trading_tx).await?;
     } else {
         // Phase 2: REST polling mode
         run_rest_mode(api.clone(), strategy_tx).await?;
@@ -156,6 +161,7 @@ async fn run_websocket_mode(
     api: Arc<PolyClient>,
     strategy_tx: mpsc::UnboundedSender<StrategyEvent>,
     pnl_tracker: PnlTracker,
+    trading_tx: mpsc::UnboundedSender<ArbitrageSignal>,
 ) -> anyhow::Result<()> {
     info!("🚀 Starting Hot Switchover WebSocket mode...");
     
@@ -234,23 +240,42 @@ async fn run_websocket_mode(
                 if let Some((condition_id, yes_price, no_price)) = state.update_by_outcome(&update.condition_id, update.price, outcome) {
                     // We have both prices now!
                     let combined = yes_price + no_price;
-                    let edge = 1.0 - combined - (combined * 0.02);
+                    // Profit per share = $0.98 (net after 2% fee) - combined cost
+                    let profit_per_share = 0.98 - combined;
+                    // Edge % = profit / combined cost
+                    let edge_pct = (profit_per_share / combined) * 100.0;
+                    // Keep edge for backward compatibility
+                    let edge = profit_per_share;
                     
                     // Sweet spot filter: only combined $0.70-$0.90, edge 10-30%
-                    let in_sweet_spot = combined >= 0.70 && combined <= 0.90;
-                    let good_edge = edge >= 0.10 && edge <= 0.30;
+                    // Lag compensation: During high-volatility periods (price swings),
+                        // require higher edge to survive 500ms sequencer delay
+                        // Markets with high price velocity will move against us during wait
+                        // So we demand more edge as a buffer
+                        let price_spread = (yes_price - no_price).abs();
+                        let is_high_vol = price_spread > 0.40 || combined < 0.75 || combined > 0.88;
+                        
+                        // Dynamic thresholds: tighter during volatility, normal otherwise
+                        let (min_edge, max_combined) = if is_high_vol {
+                            (0.15, 0.88) // Need 15%+ edge, combined ≤ $0.88
+                        } else {
+                            (0.10, 0.90) // Normal: 10%+ edge, combined ≤ $0.90
+                        };
+                        
+                        let in_sweet_spot = combined >= 0.70 && combined <= max_combined;
+                        let good_edge = edge >= min_edge && edge <= 0.30;
                     
                     // Log periodically (every 5 seconds)
                     if last_log_time.elapsed().as_secs() > 5 {
                         info!(
-                            "📋 {} | YES: ${:.4} + NO: ${:.4} = ${:.4} | Edge: {:.1}%",
+                            "📋 {} | YES: ${:.4} + NO: ${:.4} = ${:.4} | Profit: ${:.4}/sh | Edge: {:.1}%",
                             &condition_id[..8.min(condition_id.len())],
                             yes_price,
                             no_price,
                             combined,
-                            edge * 100.0
+                            profit_per_share,
+                            edge_pct,
                         );
-                        last_log_time = std::time::Instant::now();
                     }
                     
                     // Handle if in sweet spot
@@ -294,19 +319,9 @@ async fn run_websocket_mode(
                             continue;
                         }
 
-                        info!(
-                            "🎯 SWEET SPOT ARB! | {} | YES: ${:.4} + NO: ${:.4} = ${:.4} | Edge: {:.1}% | Size: {:.0}",
-                            &condition_id[..8.min(condition_id.len())],
-                            yes_price,
-                            no_price,
-                            combined,
-                            edge * 100.0,
-                            orderbook_size
-                        );
-                        
-                        // Dynamic position sizing based on edge (Kelly-inspired)
-                        // Bigger edge = more shares = more profit
-                        let shares = if edge >= 0.25 {
+                        // Dynamic sizing: edge buckets, but capped by liquidity (IOC protection)
+                        // This ensures we only trade what the orderbook can provide
+                        let base_shares = if edge >= 0.25 {
                             100 // 25%+ edge: max shares
                         } else if edge >= 0.20 {
                             75  // 20-25% edge
@@ -315,7 +330,20 @@ async fn run_websocket_mode(
                         } else {
                             30  // 10-15% edge: min shares
                         };
+                        // Cap by liquidity to prevent sweeping into bad prices
+                        let liquidity_shares = orderbook_size as i32;
+                        let shares = base_shares.min(liquidity_shares).max(30);
                         let shares_f = shares as f64;
+                        
+                        info!(
+                            "🎯 SWEET SPOT ARB! | {} | YES: ${:.4} + NO: ${:.4} = ${:.4} | Edge: {:.1}% | Size: {:.0}",
+                            &condition_id[..8.min(condition_id.len())],
+                            yes_price,
+                            no_price,
+                            combined,
+                            edge * 100.0,
+                            shares_f
+                        );
                         
                         // Calculate profit for minimum trade check
                         // Scale minimum based on shares: require at least $0.10 per share
@@ -329,73 +357,68 @@ async fn run_websocket_mode(
                             continue;
                         }
                         
-                        // Now record attempt since we're above minimum
+                        // Send to trading engine for real execution
                         pnl_tracker.record_arb_opportunity();
                         pnl_tracker.record_fill_attempt();
                         
-                        // Simulate fill rate based on edge quality
-                        // Higher edge = more likely to still be available
-                        let fill_probability = if edge >= 0.20 {
-                            0.80 // 80% for high edge
-                        } else if edge >= 0.15 {
-                            0.70 // 70% for medium edge
-                        } else {
-                            0.60 // 60% for low edge
+                        // Check 5-min rolling capital cap
+                        let now = std::time::Instant::now();
+                        let trade_capital = combined * shares_f; // Dynamic capital based on shares
+                        
+                        // Remove entries older than 5 minutes
+                        capital_history.retain(|(time, _)| now.duration_since(*time).as_secs() < CAPITAL_WINDOW_SECS);
+                        
+                        // Sum capital deployed in window
+                        let current_capital: f64 = capital_history.iter().map(|(_, c)| c).sum();
+                        
+                        if current_capital + trade_capital > MAX_CAPITAL_PER_WINDOW {
+                            // Cap hit - skip this trade
+                            continue;
+                        }
+                        
+                        // Record this trade's capital
+                        capital_history.push((now, trade_capital));
+                        
+                        // Create token data for YES and NO
+                        // Get NO token from state mapping
+                        let no_token_id = state.token_side.lock()
+                            .iter()
+                            .find(|(_, (cond, is_yes))| cond == &condition_id && !is_yes)
+                            .map(|(token_id, _)| token_id.clone())
+                            .unwrap_or_else(|| update.token_id.clone());
+                        let yes_token = TokenData {
+                            token_id: update.token_id.clone(),
+                            outcome: "yes".to_string(),
+                            price: Some(yes_price),
+                        };
+                        let no_token = TokenData {
+                            token_id: no_token_id.clone(),
+                            outcome: "no".to_string(),
+                            price: Some(no_price),
                         };
                         
-                        // In dry run, simulate fill success/failure based on edge
-                        // Use combined price digits as pseudo-random
-                        let pseudo_rand = (combined * 1000.0).fract();
+                        // Create simplified market for trading signal
+                        let market = SimplifiedMarket {
+                            condition_id: condition_id.clone(),
+                            tokens: vec![yes_token, no_token],
+                            active: true,
+                            closed: false,
+                        };
                         
-                        if pseudo_rand < fill_probability {
-                            // Check 5-min rolling capital cap
-                            let now = std::time::Instant::now();
-                            let trade_capital = combined * shares_f; // Dynamic capital based on shares
-                            
-                            // Remove entries older than 5 minutes
-                            capital_history.retain(|(time, _)| now.duration_since(*time).as_secs() < CAPITAL_WINDOW_SECS);
-                            
-                            // Sum capital deployed in window
-                            let current_capital: f64 = capital_history.iter().map(|(_, c)| c).sum();
-                            
-                            if current_capital + trade_capital > MAX_CAPITAL_PER_WINDOW {
-                                // Cap hit - skip this trade
-                                continue;
-                            }
-                            
-                            // Record this trade's capital
-                            capital_history.push((now, trade_capital));
-                            
-                            pnl_tracker.record_fill_success();
-                            
-                            // Record gas cost (Polygon ~$0.003 per tx)
-                            pnl_tracker.record_gas(0.003);
-                            
-                            let trade = create_trade_result(
-                                &update.token_id,
-                                &condition_id,
-                                yes_price,
-                                no_price,
-                                shares_f,
-                            );
-                            pnl_tracker.record_trade(&trade);
-                            
-                            // Log detailed trade for PnL report with liquidity info
-                            let timestamp = chrono::Local::now().format("%H:%M:%S");
-                            let gross_profit = shares_f - combined * shares_f - (combined * shares_f * 0.02);
-                            let net_profit = gross_profit - 0.003;
-                            info!(
-                                "✅ TRADE | {} | YES: ${:.4} x{} | NO: ${:.4} x{} | Comb: ${:.4} | Gross: ${:.4} | Gas: $0.003 | Net: ${:.4} | Liq: {:.0}",
-                                timestamp, yes_price, shares, no_price, shares, combined, gross_profit, net_profit, orderbook_size
-                            );
+                        // Send to trading engine
+                        let profit_estimate = shares_f - combined * shares_f - (combined * shares_f * 0.02) - 0.003;
+                        let signal = ArbitrageSignal {
+                            market,
+                            profit: profit_estimate,
+                            size: shares_f,
+                            yes_depth: orderbook_size,
+                            no_depth: orderbook_size,
+                        };
+                        
+                        if trading_tx.send(signal).is_err() {
+                            error!("Failed to send trading signal - channel closed");
                         } else {
-                            pnl_tracker.record_fill_failure();
-                            let timestamp = chrono::Local::now().format("%H:%M:%S");
-                            info!("❌ FILL FAILED | {} | {} | Edge: {:.1}%", 
-                                timestamp, 
-                                &condition_id[..8.min(condition_id.len())],
-                                edge * 100.0
-                            );
+                            info!("📤 Trade signal sent to engine (profit est: ${:.2})", profit_estimate);
                         }
                     }
                 }
