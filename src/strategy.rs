@@ -165,7 +165,7 @@ impl PingpongStrategy {
                                     let signal = ArbitrageSignal {
                                         market: market.clone(),
                                         profit: edge,
-                                        size: 100.0,
+                                        size: (orderbook_size.min(100.0)) as f64, // Dynamic sizing based on actual liquidity
                                         yes_depth: 200.0,
                                         no_depth: 200.0,
                                     };

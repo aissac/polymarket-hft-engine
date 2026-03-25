@@ -287,7 +287,7 @@ async fn run_websocket_mode(
                         };
 
                         // Skip if liquidity < 200 shares (filter fake edges)
-                        if orderbook_size < 200.0 {
+                        if orderbook_size < 50.0 { // Lowered from 200 to 50 - capture smaller but real edges
                             continue;
                         }
                         
