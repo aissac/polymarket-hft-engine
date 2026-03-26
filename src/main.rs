@@ -18,6 +18,7 @@ mod websocket;
 mod hot_switchover;
 mod pnl;
 mod gabagool_strategy;
+mod merger;
 
 use api::{PolyClient, SimplifiedMarket};
 use websocket::TokenData;
@@ -28,6 +29,7 @@ use websocket::OrderBookUpdate;
 use hot_switchover::{run_hot_switchover_manager, AppState};
 use pnl::{PnlTracker, create_trade_result};
 use gabagool_strategy::{GabagoolStrategy, GabagoolConfig, TradingSignal};
+use merger::PolyMerger;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -110,6 +112,17 @@ async fn main() -> anyhow::Result<()> {
     // Start trading loop
     let trading_tx = trading_tx.clone(); // Clone for use in websocket mode
     let _trading_handle = tokio::spawn(start_trading_loop(engine, trading_rx));
+    
+    // Start poly merger for capital recycling
+    let api_key = env::var("POLYMARKET_API_KEY").unwrap_or_default();
+    let wallet = env::var("POLYMARKET_WALLET").unwrap_or_default();
+    if !api_key.is_empty() && !wallet.is_empty() {
+        let merger = PolyMerger::new(api_key, wallet);
+        tokio::spawn(merger.run_loop());
+        info!("🔄 Poly Merger started (async capital recycling)");
+    } else {
+        warn!("⚠️  POLYMARKET_API_KEY or POLYMARKET_WALLET not set - merger disabled");
+    }
     
     if use_websocket {
         // Phase 3.6: Hot Switchover WebSocket mode with PnL tracking
@@ -212,7 +225,7 @@ async fn run_websocket_mode(
     // 5-min rolling capital cap tracker
     let mut capital_history: Vec<(std::time::Instant, f64)> = Vec::new();
     const CAPITAL_WINDOW_SECS: u64 = 300; // 5 minutes
-    const MAX_CAPITAL_PER_WINDOW: f64 = 115.0; // $115 max per 5-min window
+    const MAX_CAPITAL_PER_WINDOW: f64 = 250.0; // $250 max per 5-min window
     
     // Process updates from the Trading Director
     let mut scan_count = 0u64;
@@ -263,7 +276,7 @@ async fn run_websocket_mode(
                         };
                         
                         let in_sweet_spot = combined >= 0.70 && combined <= max_combined;
-                        let good_edge = edge >= min_edge && edge <= 0.30;
+                        let good_edge = edge >= min_edge && edge <= 0.35; // widened to capture real edges
                     
                     // Log periodically (every 5 seconds)
                     if last_log_time.elapsed().as_secs() > 5 {
@@ -280,14 +293,26 @@ async fn run_websocket_mode(
                     
                     // Handle if in sweet spot
                     if in_sweet_spot && good_edge {
-                        // Get orderbook snapshot for liquidity verification
-                        let orderbook_size = {
+                        // Get actual top-of-book prices AND depths for dynamic sizing
+                        // Get actual top-of-book sizes from orderbook tracker
+                        let (yes_depth, no_depth): (f64, f64) = {
                             let ob = state.orderbook.lock();
-                            ob.get(&condition_id).map(|u| u.size).unwrap_or(0.0)
+                            if let Some(update) = ob.get(&condition_id) {
+                                // Use the tracked size, but we need both YES and NO
+                                // Since we only track one size per condition, use it for both
+                                let size = update.size;
+                                (size, size)
+                            } else {
+                                continue; // No orderbook data yet
+                            }
                         };
 
-                        // Skip if liquidity < 200 shares (filter fake edges)
-                        if orderbook_size < 50.0 { // Lowered from 200 to 50 - capture smaller but real edges
+                        // Dynamic sizing: use BOTH edges' available liquidity (IOC protection)
+                        // Size to the limiting side to avoid sweeping into bad prices
+                        let min_depth = yes_depth.min(no_depth);
+                        
+                        // Skip if liquidity < 10 shares (filter ghost liquidity)
+                        if min_depth < 10.0 {
                             continue;
                         }
                         
@@ -319,20 +344,22 @@ async fn run_websocket_mode(
                             continue;
                         }
 
-                        // Dynamic sizing: edge buckets, but capped by liquidity (IOC protection)
-                        // This ensures we only trade what the orderbook can provide
+                        // Dynamic sizing: edge buckets, but capped by ACTUAL top-of-book depth
+                        // This ensures we only trade what the orderbook can provide at profitable prices
                         let base_shares = if edge >= 0.25 {
-                            100 // 25%+ edge: max shares
+                            50  // 25%+ edge: was 100, reduced for better fill rate
                         } else if edge >= 0.20 {
-                            75  // 20-25% edge
+                            40  // 20-25% edge: was 75
                         } else if edge >= 0.15 {
-                            50  // 15-20% edge
+                            30  // 15-20% edge: was 50
                         } else {
-                            30  // 10-15% edge: min shares
+                            20  // 10-15% edge: was 30
                         };
-                        // Cap by liquidity to prevent sweeping into bad prices
-                        let liquidity_shares = orderbook_size as i32;
-                        let shares = base_shares.min(liquidity_shares).max(30);
+                        
+                        // Cap by actual available depth (IOC protection - don't sweep the book)
+                        let max_depth_shares = (min_depth * 0.80) as i32; // Use 80% of available to leave headroom
+                        let shares = base_shares.min(max_depth_shares).max(10);
+                        let shares_f = shares as f64;
                         let shares_f = shares as f64;
                         
                         info!(
@@ -354,6 +381,7 @@ async fn run_websocket_mode(
                         // Only execute if net profit >= minimum threshold
                         if net_profit < min_profit {
                             // Below minimum trade value - skip
+                            info!("BLOCKED: net_profit ${:.4} < min_profit ${:.4} for {} | Edge: {:.1}% | Size: {:.0}", net_profit, min_profit, &condition_id[..8.min(condition_id.len())], edge * 100.0, shares_f);
                             continue;
                         }
                         
@@ -373,6 +401,7 @@ async fn run_websocket_mode(
                         
                         if current_capital + trade_capital > MAX_CAPITAL_PER_WINDOW {
                             // Cap hit - skip this trade
+                            info!("BLOCKED: CAPITAL WINDOW ${:.2}+${:.2}>${:.2} for {}", current_capital, trade_capital, MAX_CAPITAL_PER_WINDOW, &condition_id[..8.min(condition_id.len())]);
                             continue;
                         }
                         
@@ -400,9 +429,12 @@ async fn run_websocket_mode(
                         // Create simplified market for trading signal
                         let market = SimplifiedMarket {
                             condition_id: condition_id.clone(),
+                            question: String::new(),
                             tokens: vec![yes_token, no_token],
                             active: true,
                             closed: false,
+                            hours_until_resolve: 0,
+                            slug: String::new(),
                         };
                         
                         // Send to trading engine
@@ -411,8 +443,8 @@ async fn run_websocket_mode(
                             market,
                             profit: profit_estimate,
                             size: shares_f,
-                            yes_depth: orderbook_size,
-                            no_depth: orderbook_size,
+                            yes_depth,
+                            no_depth,
                         };
                         
                         if trading_tx.send(signal).is_err() {

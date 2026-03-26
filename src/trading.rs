@@ -372,17 +372,28 @@ pub async fn start_trading_loop(
             }
         }
         
-        match engine.execute_arbitrage(&signal.market, signal.size).await {
+        let trade_result = match engine.execute_arbitrage(&signal.market, signal.size).await {
             Ok(result) => {
                 if result.yes_filled && result.no_filled {
                     info!("✅ Trade complete: {} profit=${:.4} (${:.2} total)", result.market_id, result.profit_estimate, result.profit_estimate * result.size);
                 } else if result.yes_filled || result.no_filled {
                     warn!("⚠️ Partial fill - LEG RISK on {}", result.market_id);
                 }
+                Some(result)
             }
             Err(e) => {
                 error!("❌ Trade error: {}", e);
+                None
             }
+        };
+
+        // Release reserved capital after trade completes (success or failure)
+        let mut active = engine.active_capital.lock().unwrap();
+        let mut total = engine.total_active_capital.lock().unwrap();
+        if let Some(reserved) = active.get(&signal.market.condition_id).copied() {
+            active.remove(&signal.market.condition_id);
+            *total = (*total - reserved).max(0.0);
+            debug!("📊 MLE: Released ${:.2} | Total: ${:.2}", reserved, *total);
         }
     }
     
