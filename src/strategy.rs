@@ -129,6 +129,8 @@ impl PingpongStrategy {
                             &market.condition_id,
                             yes_price,
                             no_price,
+                            0.0,  // yes_depth (placeholder)
+                            0.0,  // no_depth (placeholder)
                         );
                         
                         // Check if this market has arbitrage in the SWEET SPOT

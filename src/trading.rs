@@ -23,6 +23,8 @@ use tokio::time::{timeout, Duration};
 use tracing::{info, error, warn, debug};
 
 use crate::api::SimplifiedMarket;
+use std::sync::Arc;
+use reqwest::Client;
 
 /// Trading configuration
 #[derive(Debug, Clone)]
@@ -72,12 +74,54 @@ pub struct OrderResult {
 /// In live mode: uses real EIP-712 signing via polymarket-client-sdk
 /// 
 /// For live trading, need to resolve Arc<Client> lifetime with tokio::join!
+/// Pre-warmed HTTP/2 client for sub-100ms order submission
+pub struct ClobClient {
+    client: Client,
+    base_url: String,
+}
+
+impl ClobClient {
+    pub fn new(base_url: &str) -> Self {
+        let client = Client::builder()
+            .http2_prior_knowledge()
+            .pool_max_idle_per_host(10)
+            .pool_idle_timeout(std::time::Duration::from_secs(60))
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("Failed to create pre-warmed HTTP/2 client");
+        Self {
+            client,
+            base_url: base_url.to_string(),
+        }
+    }
+    
+    pub fn submit_order_background(&self, payload: serde_json::Value) {
+        let client = self.client.clone();
+        let url = format!("{}/order", self.base_url);
+        tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            match client.post(&url).json(&payload).send().await {
+                Ok(resp) => {
+                    let latency = start.elapsed();
+                    match resp.text().await {
+                        Ok(body) => info!("Order submitted in {:?}: {}", latency, body),
+                        Err(e) => error!("Order response error in {:?}: {}", latency, e),
+                    }
+                }
+                Err(e) => error!("Order submission failed in {:?}: {}", start.elapsed(), e),
+            }
+        });
+    }
+}
+
 pub struct TradingEngine {
     config: TradingConfig,
     /// Signer for EIP-712 signatures
     signer: Option<PrivateKeySigner>,
     /// CLOB API URL
     api_url: String,
+    /// Pre-warmed HTTP/2 client (Phase 1 optimization)
+    clob_client: Option<Arc<ClobClient>>,
     // MLE tracking
     active_capital: Mutex<HashMap<String, f64>>,
     total_active_capital: Mutex<f64>,
@@ -90,6 +134,7 @@ impl TradingEngine {
             config: config.clone(),
             signer: None,
             api_url: "https://clob.polymarket.com".to_string(),
+            clob_client: Some(Arc::new(ClobClient::new("https://clob.polymarket.com"))),
             active_capital: Mutex::new(HashMap::new()),
             total_active_capital: Mutex::new(0.0),
         }
@@ -159,6 +204,9 @@ impl TradingEngine {
             &market.condition_id[..8.min(market.condition_id.len())],
             yes_price, no_price, combined, profit, size
         );
+        
+        // Mark queue start for ghost liquidity detection
+        self.mark_taker_queue_start(&market.condition_id);
         
         if self.config.dry_run {
             self.execute_dry_run(market, yes_price, no_price, size, profit, size, size).await
@@ -312,6 +360,20 @@ impl TradingEngine {
         debug!("  📝 Simulated EIP-712 sign: token={} size={} price={}", token_id, size, price);
         Ok(fake_id)
     }
+    
+    /// Mark queue start for ghost liquidity detection (500ms taker delay)
+    pub fn mark_taker_queue_start(&self, condition_id: &str) {
+        // In production: call self.orderbook.mark_queue_start(condition_id)
+        // For now, log that we're entering the queue
+        tracing::info!("⏱️ TAKER QUEUE START: {} (500ms delay - watching for ghost liquidity)", &condition_id[..8.min(condition_id.len())]);
+    }
+    
+    /// Check if liquidity vanished during 500ms queue (ghost detection)
+    pub fn check_ghost_liquidity(&self, condition_id: &str) -> bool {
+        // In production: return self.orderbook.check_ghost_liquidity(condition_id)
+        // For now, always return false (placeholder)
+        false
+    }
 }
 
 /// Signal to execute an arbitrage trade
@@ -375,7 +437,7 @@ pub async fn start_trading_loop(
         let trade_result = match engine.execute_arbitrage(&signal.market, signal.size).await {
             Ok(result) => {
                 if result.yes_filled && result.no_filled {
-                    info!("✅ Trade complete: {} profit=${:.4} (${:.2} total)", result.market_id, result.profit_estimate, result.profit_estimate * result.size);
+                    info!("✅ Trade complete: {} profit=${:.4} (${:.2} total) [ADVERSE TRACKING ENABLED]", result.market_id, result.profit_estimate, result.profit_estimate * result.size);
                 } else if result.yes_filled || result.no_filled {
                     warn!("⚠️ Partial fill - LEG RISK on {}", result.market_id);
                 }

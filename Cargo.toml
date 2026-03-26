@@ -32,6 +32,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Share state
 parking_lot = "0.12"
+dashmap = "6"
 
 # Polymarket SDK (Phase 2: Order execution)
 # Note: 'clob' feature not available in 0.3.x - using core functionality

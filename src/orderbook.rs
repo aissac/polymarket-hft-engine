@@ -1,20 +1,12 @@
-//! OrderBook Tracker for Pingpong Strategy
+//! OrderBook Tracker for Pingpong Strategy - Phase 2: DashMap for Ghost Detection
 //! 
-//! Thread-safe tracker for YES/NO prices across multiple markets.
+//! Thread-safe orderbook tracker using DashMap for concurrent access.
+//! Enables real-time ghost liquidity detection during 500ms taker queue.
 
-use parking_lot::RwLock;
-use std::collections::HashMap;
+use dashmap::DashMap;
+use std::sync::Arc;
 
-/// Arbitrage opportunity found
-#[derive(Debug, Clone)]
-pub struct ArbitrageInfo {
-    pub yes_ask: f64,
-    pub no_ask: f64,
-    pub combined_cost: f64,
-    pub profit_per_share: f64,
-}
-
-/// Market price data
+/// Market price data with depth tracking
 #[derive(Debug, Clone)]
 pub struct MarketPrices {
     pub condition_id: String,
@@ -22,10 +14,30 @@ pub struct MarketPrices {
     pub yes_best_ask: Option<f64>,
     pub no_best_bid: Option<f64>,
     pub no_best_ask: Option<f64>,
+    pub yes_depth: f64,  // Size at best ask
+    pub no_depth: f64,   // Size at best ask
     pub last_update: i64,
+    /// Track depth changes during 500ms queue (ghost detection)
+    pub queue_start_yes_depth: Option<f64>,
+    pub queue_start_no_depth: Option<f64>,
 }
 
 impl MarketPrices {
+    pub fn new(condition_id: String) -> Self {
+        Self {
+            condition_id,
+            yes_best_bid: None,
+            yes_best_ask: None,
+            no_best_bid: None,
+            no_best_ask: None,
+            yes_depth: 0.0,
+            no_depth: 0.0,
+            last_update: 0,
+            queue_start_yes_depth: None,
+            queue_start_no_depth: None,
+        }
+    }
+
     pub fn combined_cost(&self) -> Option<f64> {
         match (self.yes_best_ask, self.no_best_ask) {
             (Some(yes), Some(no)) => Some(yes + no),
@@ -38,89 +50,98 @@ impl MarketPrices {
             .map(|c| c < target)
             .unwrap_or(false)
     }
-    
-    pub fn arbitrage_info(&self, target: f64, fee_pct: f64) -> Option<ArbitrageInfo> {
-        let (yes_ask, no_ask) = (self.yes_best_ask?, self.no_best_ask?);
-        let combined = yes_ask + no_ask;
-        
-        if combined < target {
-            let payout = 1.0;
-            let fee = payout * fee_pct;
-            let profit = payout - fee - combined;
-            Some(ArbitrageInfo {
-                yes_ask,
-                no_ask,
-                combined_cost: combined,
-                profit_per_share: profit,
-            })
-        } else {
-            None
+
+    /// Check if liquidity vanished during queue (ghost detection)
+    pub fn liquidity_vanished_during_queue(&self) -> bool {
+        match (self.queue_start_yes_depth, self.queue_start_no_depth) {
+            (Some(start_yes), Some(start_no)) => {
+                // If depth dropped by >50%, liquidity vanished (maker pulled quote)
+                let yes_vanished = self.yes_depth < start_yes * 0.5;
+                let no_vanished = self.no_depth < start_no * 0.5;
+                yes_vanished || no_vanished
+            }
+            _ => false,
         }
+    }
+
+    /// Record depth at start of 500ms queue
+    pub fn mark_queue_start(&mut self) {
+        self.queue_start_yes_depth = Some(self.yes_depth);
+        self.queue_start_no_depth = Some(self.no_depth);
+    }
+
+    /// Clear queue markers after execution
+    pub fn clear_queue_markers(&mut self) {
+        self.queue_start_yes_depth = None;
+        self.queue_start_no_depth = None;
     }
 }
 
-/// Thread-safe orderbook tracker
+/// Thread-safe orderbook tracker using DashMap (lock-free concurrent access)
 pub struct OrderBookTracker {
-    markets: RwLock<HashMap<String, MarketPrices>>,
+    markets: Arc<DashMap<String, MarketPrices>>,
 }
 
 impl OrderBookTracker {
     pub fn new() -> Self {
         Self {
-            markets: RwLock::new(HashMap::new()),
+            markets: Arc::new(DashMap::new()),
         }
     }
     
     /// Update prices for a market
-    pub fn update(&self, condition_id: &str, yes_ask: Option<f64>, no_ask: Option<f64>) {
-        let mut markets = self.markets.write();
+    pub fn update(&self, condition_id: &str, yes_ask: Option<f64>, no_ask: Option<f64>, yes_depth: f64, no_depth: f64) {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
         
-        if let Some(existing) = markets.get_mut(condition_id) {
-            existing.yes_best_ask = yes_ask.or(existing.yes_best_ask);
-            existing.no_best_ask = no_ask.or(existing.no_best_ask);
-            existing.last_update = timestamp;
-        } else {
-            markets.insert(condition_id.to_string(), MarketPrices {
-                condition_id: condition_id.to_string(),
-                yes_best_bid: None,
-                yes_best_ask: yes_ask,
-                no_best_bid: None,
-                no_best_ask: no_ask,
-                last_update: timestamp,
-            });
+        let mut market = self.markets
+            .entry(condition_id.to_string())
+            .or_insert_with(|| MarketPrices::new(condition_id.to_string()));
+        
+        market.yes_best_ask = yes_ask;
+        market.no_best_ask = no_ask;
+        market.yes_depth = yes_depth;
+        market.no_depth = no_depth;
+        market.last_update = timestamp;
+    }
+
+    /// Get market prices (read-only, lock-free)
+    pub fn get(&self, condition_id: &str) -> Option<MarketPrices> {
+        self.markets.get(condition_id).map(|r| r.clone())
+    }
+
+    /// Mark queue start for ghost detection
+    pub fn mark_queue_start(&self, condition_id: &str) {
+        if let Some(mut market) = self.markets.get_mut(condition_id) {
+            market.mark_queue_start();
         }
     }
-    
-    /// Get combined cost for a market
-    pub fn get_combined_cost(&self, condition_id: &str) -> Option<f64> {
-        let markets = self.markets.read();
-        markets.get(condition_id).and_then(|m| m.combined_cost())
+
+    /// Check if liquidity vanished during queue
+    pub fn check_ghost_liquidity(&self, condition_id: &str) -> bool {
+        self.markets
+            .get(condition_id)
+            .map(|r| r.liquidity_vanished_during_queue())
+            .unwrap_or(false)
     }
-    
-    /// Find all arbitrage opportunities
-    pub fn find_arbitrages(&self, target: f64) -> Vec<(String, ArbitrageInfo)> {
-        let markets = self.markets.read();
-        let mut results = Vec::new();
-        
-        for (condition_id, market) in markets.iter() {
-            if let Some(info) = market.arbitrage_info(target, 0.02) {
-                results.push((condition_id.clone(), info));
-            }
+
+    /// Clear queue markers after execution
+    pub fn clear_queue_markers(&self, condition_id: &str) {
+        if let Some(mut market) = self.markets.get_mut(condition_id) {
+            market.clear_queue_markers();
         }
-        
-        results
     }
-    
-    /// Get all tracked markets
-    pub fn get_all_markets(&self) -> Vec<(String, Option<f64>)> {
-        let markets = self.markets.read();
-        markets.iter()
-            .map(|(id, m)| (id.clone(), m.combined_cost()))
-            .collect()
+
+    /// Get all markets (for reporting)
+    pub fn get_all_markets(&self) -> Vec<MarketPrices> {
+        self.markets.iter().map(|r| r.clone()).collect()
+    }
+
+    /// Count active markets
+    pub fn market_count(&self) -> usize {
+        self.markets.len()
     }
 }
 

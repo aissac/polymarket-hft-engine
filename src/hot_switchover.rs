@@ -43,6 +43,8 @@ pub struct AppState {
     pub in_flight_trades: Mutex<HashMap<String, std::time::Instant>>,
     /// Local orderbook state
     pub orderbook: Mutex<HashMap<String, OrderBookUpdate>>,
+    /// Ghost liquidity tracker (DashMap for concurrent access)
+    pub tracker: Arc<crate::orderbook::OrderBookTracker>,
     /// Token to side mapping: token_id → (condition_id, is_yes)
     pub token_side: Mutex<HashMap<String, (String, bool)>>,
     /// YES/NO prices per condition: condition_id → (yes_price, no_price, yes_size, no_size)
@@ -88,6 +90,7 @@ impl AppState {
             risk_paused: AtomicBool::new(true), // Paused until first WS connects
             in_flight_trades: Mutex::new(HashMap::new()),
             orderbook: Mutex::new(HashMap::new()),
+            tracker: Arc::new(crate::orderbook::OrderBookTracker::new()),
             token_side: Mutex::new(HashMap::new()),
             market_prices: Mutex::new(HashMap::new()),
             last_traded_bucket: Mutex::new(HashMap::new()),
@@ -715,16 +718,27 @@ async fn start_trading_director(
                     continue; // Primary is healthy, skip backup updates
                 }
                 
+                let market_id = update.condition_id.clone();
+                let mid_price = update.price;
+                
                 // HALT CHECK: Don't trade on potentially stale data
                 if !state.can_trade() {
                     continue;
                 }
                 
-                let market_id = update.condition_id.clone();
-                let mid_price = update.price;
+                // Check for ghost liquidity (depth vanished during queue)
+                if state.tracker.check_ghost_liquidity(&market_id) {
+                    tracing::warn!("👻 GHOST LIQUIDITY: {} - skipping update (depth vanished during queue)", &market_id[..8.min(market_id.len())]);
+                    continue;
+                }
                 
                 // Update local orderbook
                 state.orderbook.lock().insert(market_id.clone(), update.clone());
+                
+                // Update DashMap tracker with depth info (for ghost detection)
+                let yes_depth = if update.outcome.to_lowercase() == "yes" { update.size } else { 0.0 };
+                let no_depth = if update.outcome.to_lowercase() == "no" { update.size } else { 0.0 };
+                state.tracker.update(&market_id, Some(update.price), Some(update.price), yes_depth, no_depth);
                 
                 // Forward to main loop for processing
                 let sent = update_tx.send(update);
