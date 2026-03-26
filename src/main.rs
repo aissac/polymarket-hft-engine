@@ -94,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
         dry_run,
         min_profit: 0.01,
         max_leg_usdc: 50.0,
-        total_bankroll: 1000.0, // $1000 bankroll
+        total_bankroll: 200.0, // $1000 bankroll
         max_per_market_pct: 0.05, // 5% per market
         max_total_pct: 0.15, // 15% total
     };
@@ -225,7 +225,7 @@ async fn run_websocket_mode(
     // 5-min rolling capital cap tracker
     let mut capital_history: Vec<(std::time::Instant, f64)> = Vec::new();
     const CAPITAL_WINDOW_SECS: u64 = 300; // 5 minutes
-    const MAX_CAPITAL_PER_WINDOW: f64 = 250.0; // $250 max per 5-min window
+    const MAX_CAPITAL_PER_WINDOW: f64 = 75.0; // $250 max per 5-min window
     
     // Process updates from the Trading Director
     let mut scan_count = 0u64;
@@ -359,6 +359,10 @@ async fn run_websocket_mode(
                         // Cap by actual available depth (IOC protection - don't sweep the book)
                         let max_depth_shares = (min_depth * 0.80) as i32; // Use 80% of available to leave headroom
                         let shares = base_shares.min(max_depth_shares).max(10);
+                        
+                        // HARD CAP: 0 max per trade (notebooklm recommendation)
+                        let max_cap_shares = ((50.0 / combined) as i32).max(10);
+                        let shares = shares.min(max_cap_shares);
                         let shares_f = shares as f64;
                         let shares_f = shares as f64;
                         
