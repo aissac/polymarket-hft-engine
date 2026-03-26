@@ -316,6 +316,15 @@ async fn run_websocket_mode(
                             continue;
                         }
                         
+                        // MINIMUM PRICE FILTER (prevent one-sided/dust markets)
+                        // Both YES and NO must have real liquidity (>= 0.05)
+                        if yes_price < 0.05 || no_price < 0.05 {
+                            if scan_count % 100 == 0 {
+                                info!("SKIP DUST: {} | YES: {:.4} + NO: {:.4}", &condition_id[..8], yes_price, no_price);
+                            }
+                            continue;
+                        }
+                        
                         // ═══════════════════════════════════════════════════════
                         // RISK MANAGEMENT CHECKS (NotebookLM recommendations)
                         // ═══════════════════════════════════════════════════════
