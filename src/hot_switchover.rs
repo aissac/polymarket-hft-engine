@@ -520,13 +520,8 @@ async fn maintain_ws_connection(
                 while let Some(msg_result) = ws_stream.next().await {
                     match msg_result {
                         Ok(Message::Text(text)) => {
-                            // Try polyfill-rs FastOrderBookProcessor first (~0.28µs SIMD parsing)
                             // Parse orderbook updates (serde_json)
-                            // Note: FastOrderBookProcessor infrastructure is initialized but not used in hot path yet
-                            // due to Mutex/Arc mutability constraints - SIMD swap pending
-                            let parsed_updates = parse_orderbook_update(&text).ok();
-
-                            if let Some(updates) = parsed_updates {
+                            if let Ok(updates) = parse_orderbook_update(&text) {
                                 for update in updates {
                                     let _ = event_tx.send(WsEvent::Update(source, update));
                                 }
