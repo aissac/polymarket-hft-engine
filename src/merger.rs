@@ -40,7 +40,7 @@ pub struct PolyMerger {
 }
 
 impl PolyMerger {
-    pub fn new(api_key: String, wallet: String) -> Self {
+    pub fn new(api_key: String, wallet: String, _dry_run: bool) -> Self {
         Self {
             client: reqwest::Client::new(),
             api_key,

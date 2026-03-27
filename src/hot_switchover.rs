@@ -112,6 +112,15 @@ impl AppState {
             max_daily_loss: 50.0, // Max $50 daily loss before pause
         }
     }
+    
+    /// Create AppState with an external OrderBookTracker (shared with TradingEngine for ghost detection)
+    pub fn with_tracker(tracker: Arc<crate::orderbook::OrderBookTracker>) -> Self {
+        Self {
+            tracker,
+            ..Self::new()
+        }
+    }
+    
     /// Halt all trading - call on disconnect
     pub fn halt_trading(&self) {
         self.risk_paused.store(true, Ordering::SeqCst);
@@ -578,6 +587,13 @@ async fn maintain_ws_connection(
 fn parse_orderbook_update(text: &str) -> Result<Vec<OrderBookUpdate>, serde_json::Error> {
     let json: serde_json::Value = serde_json::from_str(text)?;
     
+    // Log raw message occasionally for debugging
+    static MSG_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = MSG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if count % 500 == 0 {
+        tracing::info!("📥 RAW WS MESSAGE: {}", &text[..text.len().min(500)]);
+    }
+    
     // Message is an array - take first element
     let obj = if json.is_array() {
         json.as_array().and_then(|arr| arr.first()).unwrap_or(&json)
@@ -603,14 +619,19 @@ fn parse_orderbook_update(text: &str) -> Result<Vec<OrderBookUpdate>, serde_json
             let size = change["size"].as_str()
                 .and_then(|s| s.parse::<f64>().ok())
                 .unwrap_or(0.0);
-            // Extract outcome from price_changes - Polymarket sends "YES" or "NO"
-            let outcome = change["outcome"].as_str()
-                .map(|s| s.to_lowercase())
-                .unwrap_or_else(|| "yes".to_string());
             // Get the token_id from this specific price_change entry
             let change_token_id = change["asset_id"].as_str()
                 .unwrap_or("")
                 .to_string();
+            
+            // CRITICAL FIX: Determine outcome from token_id, not from "outcome" field
+            // Polymarket DOES NOT send "outcome" in price_changes messages
+            // We must look up whether this token is YES or NO from our mapping
+            let outcome = {
+                // This will be looked up later in AppState when we have access to token_side
+                // For now, use placeholder - the real outcome is determined by token_id
+                "unknown".to_string()
+            };
             
             updates.push(OrderBookUpdate {
                 condition_id: condition_id.clone(),
@@ -736,8 +757,50 @@ async fn start_trading_director(
                 state.orderbook.lock().insert(market_id.clone(), update.clone());
                 
                 // Update DashMap tracker with depth info (for ghost detection)
-                let yes_depth = if update.outcome.to_lowercase() == "yes" { update.size } else { 0.0 };
-                let no_depth = if update.outcome.to_lowercase() == "no" { update.size } else { 0.0 };
+                // CRITICAL: Look up whether this token is YES or NO from token_side mapping
+                // Polymarket WebSocket does NOT send "outcome" field in price_changes
+                static UPDATE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let count = UPDATE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                
+                let (yes_depth, no_depth) = {
+                    let mapping = state.token_side.lock();
+                    match mapping.get(&update.token_id) {
+                        Some((_, is_yes)) => {
+                            if *is_yes {
+                                (update.size, 0.0)
+                            } else {
+                                (0.0, update.size)
+                            }
+                        }
+                        None => {
+                            // Token not in mapping - log warning occasionally
+                            if count % 1000 == 0 {
+                                tracing::warn!("⚠️ Token {} not in token_side mapping", &update.token_id[..8.min(update.token_id.len())]);
+                            }
+                            (0.0, 0.0)
+                        }
+                    }
+                };
+                
+                // Log every 100 updates for debugging
+                if count % 100 == 0 {
+                    let token_side_str = {
+                        let mapping = state.token_side.lock();
+                        match mapping.get(&update.token_id) {
+                            Some((_, is_yes)) => if *is_yes { "YES" } else { "NO" },
+                            None => "UNKNOWN"
+                        }
+                    };
+                    tracing::info!(
+                        "📊 DEPTH UPDATE: {} | token={} | yes_depth={:.2} | no_depth={:.2} | price={:.4}",
+                        &market_id[..8.min(market_id.len())],
+                        token_side_str,
+                        yes_depth,
+                        no_depth,
+                        update.price
+                    );
+                }
+                
                 state.tracker.update(&market_id, Some(update.price), Some(update.price), yes_depth, no_depth);
                 
                 // Forward to main loop for processing
@@ -797,66 +860,5 @@ impl AppState {
             }
         }
         None
-    }
-}
-
-// =============================================================================
-// POLYFILL-RS: SIMD-Accelerated WebSocket Parsing (0.28µs hot path)
-// =============================================================================
-
-use polyfill_rs::{OrderBookManager, WsBookUpdateProcessor};
-
-/// Fast orderbook processor using polyfill-rs SIMD parsing
-pub struct FastOrderBookProcessor {
-    manager: OrderBookManager,
-    processor: WsBookUpdateProcessor,
-}
-
-impl FastOrderBookProcessor {
-    pub fn new(levels: usize) -> Self {
-        Self {
-            manager: OrderBookManager::new(levels),
-            processor: WsBookUpdateProcessor::new(4096),
-        }
-    }
-    
-    /// Process WebSocket message with SIMD acceleration
-    /// Returns (book_messages_processed, levels_applied)
-    pub fn process(&mut self, text: String) -> anyhow::Result<(usize, usize)> {
-        let stats = self.processor.process_text(text, &self.manager)?;
-        Ok((stats.book_messages, stats.book_levels_applied))
-    }
-    
-    /// Get best prices for a condition_id
-    pub fn get_best_prices(&self, condition_id: &str) -> Option<(f64, f64)> {
-        self.manager.get_book(condition_id).ok().map(|book| {
-            let yes_ask = book.asks.first()
-                .and_then(|l| l.price.to_string().parse::<f64>().ok())
-                .unwrap_or(0.0);
-            let no_bid = book.bids.first()
-                .and_then(|l| l.price.to_string().parse::<f64>().ok())
-                .unwrap_or(0.0);
-            (yes_ask, no_bid)
-        })
-    }
-    
-    /// Get top-of-book size for liquidity check
-    pub fn get_top_size(&self, condition_id: &str) -> f64 {
-        self.manager.get_book(condition_id).ok()
-            .map(|book| {
-                let yes_size: f64 = book.asks.iter()
-                    .map(|l| l.size.to_string().parse::<f64>().unwrap_or(0.0))
-                    .sum();
-                let no_size: f64 = book.bids.iter()
-                    .map(|l| l.size.to_string().parse::<f64>().unwrap_or(0.0))
-                    .sum();
-                yes_size.max(no_size)
-            })
-            .unwrap_or(0.0)
-    }
-    
-    /// Get underlying manager for advanced use
-    pub fn manager(&self) -> &OrderBookManager {
-        &self.manager
     }
 }

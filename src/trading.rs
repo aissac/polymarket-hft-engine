@@ -23,8 +23,9 @@ use tokio::time::{timeout, Duration};
 use tracing::{info, error, warn, debug};
 
 use crate::api::SimplifiedMarket;
-use std::sync::Arc;
 use reqwest::Client;
+use crate::orderbook::OrderBookTracker;
+use std::sync::Arc;
 
 /// Trading configuration
 #[derive(Debug, Clone)]
@@ -122,6 +123,8 @@ pub struct TradingEngine {
     api_url: String,
     /// Pre-warmed HTTP/2 client (Phase 1 optimization)
     clob_client: Option<Arc<ClobClient>>,
+    /// Orderbook tracker for ghost liquidity detection
+    orderbook: Arc<OrderBookTracker>,
     // MLE tracking
     active_capital: Mutex<HashMap<String, f64>>,
     total_active_capital: Mutex<f64>,
@@ -129,14 +132,16 @@ pub struct TradingEngine {
 
 impl TradingEngine {
     /// Create a new trading engine
-    pub fn new(config: TradingConfig) -> Self {
+    pub fn new(config: TradingConfig, orderbook: Arc<OrderBookTracker>) -> Self {
         Self {
             config: config.clone(),
             signer: None,
             api_url: "https://clob.polymarket.com".to_string(),
+            orderbook,
             clob_client: Some(Arc::new(ClobClient::new("https://clob.polymarket.com"))),
             active_capital: Mutex::new(HashMap::new()),
             total_active_capital: Mutex::new(0.0),
+
         }
     }
 
@@ -180,7 +185,7 @@ impl TradingEngine {
     /// 
     /// Currently only supports dry-run mode.
     /// Live trading requires resolving Arc<Client> lifetime with tokio::join!
-    pub async fn execute_arbitrage(&self, market: &SimplifiedMarket, size: f64) -> Result<OrderResult> {
+    pub async fn execute_arbitrage(&self, market: &SimplifiedMarket, size: f64, yes_depth: f64, no_depth: f64) -> Result<OrderResult> {
         let yes_price = market.yes_price().unwrap_or(0.0);
         let no_price = market.no_price().unwrap_or(0.0);
         let combined = yes_price + no_price;
@@ -206,7 +211,7 @@ impl TradingEngine {
         );
         
         // Mark queue start for ghost liquidity detection
-        self.mark_taker_queue_start(&market.condition_id);
+        self.mark_taker_queue_start(&market.condition_id, yes_depth, no_depth);
         
         if self.config.dry_run {
             self.execute_dry_run(market, yes_price, no_price, size, profit, size, size).await
@@ -362,17 +367,32 @@ impl TradingEngine {
     }
     
     /// Mark queue start for ghost liquidity detection (500ms taker delay)
-    pub fn mark_taker_queue_start(&self, condition_id: &str) {
-        // In production: call self.orderbook.mark_queue_start(condition_id)
-        // For now, log that we're entering the queue
+    /// Pass depths from ARB detection time to initialize tracker before WebSocket updates arrive
+    pub fn mark_taker_queue_start(&self, condition_id: &str, yes_depth: f64, no_depth: f64) {
+        // Initialize market with depths from ARB detection time
+        // This ensures ghost detection has valid start depths even before WebSocket updates
+        self.orderbook.init_market(condition_id, yes_depth, no_depth);
+        self.orderbook.mark_queue_start(condition_id);
         tracing::info!("⏱️ TAKER QUEUE START: {} (500ms delay - watching for ghost liquidity)", &condition_id[..8.min(condition_id.len())]);
     }
     
     /// Check if liquidity vanished during 500ms queue (ghost detection)
-    pub fn check_ghost_liquidity(&self, condition_id: &str) -> bool {
-        // In production: return self.orderbook.check_ghost_liquidity(condition_id)
-        // For now, always return false (placeholder)
-        false
+    /// In DRY RUN: Our fills are simulated, so depth drops are REAL ghost liquidity
+    /// In LIVE: Our fills consume liquidity, so subtract our fills from depth delta
+    pub fn check_ghost_liquidity(&self, condition_id: &str, filled_size: f64, dry_run: bool) -> bool {
+        let ghost_detected = if dry_run {
+            // DRY RUN: Don't subtract fills - they're simulated, not real consumption
+            self.orderbook.check_ghost_liquidity(condition_id)
+        } else {
+            // LIVE: Subtract our fills - they actually consumed liquidity
+            self.orderbook.check_ghost_liquidity_with_fill(condition_id, filled_size)
+        };
+        
+        if ghost_detected {
+            let mode = if dry_run { "DRY RUN" } else { "LIVE" };
+            tracing::warn!("👻 GHOST LIQUIDITY DETECTED [{}]: {} - depth vanished!", mode, &condition_id[..8.min(condition_id.len())]);
+        }
+        ghost_detected
     }
 }
 
@@ -434,10 +454,22 @@ pub async fn start_trading_loop(
             }
         }
         
-        let trade_result = match engine.execute_arbitrage(&signal.market, signal.size).await {
+        let trade_result = match engine.execute_arbitrage(&signal.market, signal.size, signal.yes_depth, signal.no_depth).await {
             Ok(result) => {
+                // Check for ghost liquidity after trade
+                let ghost_detected = engine.check_ghost_liquidity(&signal.market.condition_id, result.size, dry_run);
+                
                 if result.yes_filled && result.no_filled {
-                    info!("✅ Trade complete: {} profit=${:.4} (${:.2} total) [ADVERSE TRACKING ENABLED]", result.market_id, result.profit_estimate, result.profit_estimate * result.size);
+                    if ghost_detected {
+                        warn!("👻 GHOST LIQUIDITY DETECTED: {} - depth vanished during queue!", &result.market_id[..8.min(result.market_id.len())]);
+                    }
+                    info!("✅ Trade complete: {} | {} | profit=${:.4} (${:.2} total) [ghost: {}]", 
+                        &result.market_id[..8.min(result.market_id.len())],
+                        &signal.market.slug[..8.min(signal.market.slug.len())],
+                        result.profit_estimate, 
+                        result.profit_estimate * result.size, 
+                        if ghost_detected { "YES" } else { "NO" });
+                    info!("📝 DRY MERGER: Recorded {} YES={} NO={}", &result.market_id[..8.min(result.market_id.len())], result.size, result.size);
                 } else if result.yes_filled || result.no_filled {
                     warn!("⚠️ Partial fill - LEG RISK on {}", result.market_id);
                 }

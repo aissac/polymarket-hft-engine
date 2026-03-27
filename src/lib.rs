@@ -8,7 +8,7 @@ mod api;
 mod strategy;
 mod trading;
 mod websocket;
-mod polyfill_integration;
+// mod polyfill_integration; // Disabled - polyfill-rs bug
 pub mod production;
 
 pub use orderbook::OrderBookTracker;

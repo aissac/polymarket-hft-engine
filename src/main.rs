@@ -98,7 +98,12 @@ async fn main() -> anyhow::Result<()> {
         max_per_market_pct: 0.05, // 5% per market
         max_total_pct: 0.15, // 15% total
     };
-    let mut engine = TradingEngine::new(trading_config);
+    
+    // Create orderbook tracker for ghost detection
+    let tracker = Arc::new(OrderBookTracker::new());
+    info!("✅ OrderBookTracker initialized");
+    
+    let mut engine = TradingEngine::new(trading_config, tracker.clone());
     
     // Initialize auth if private key is available
     if !private_key.is_empty() {
@@ -117,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
     let api_key = env::var("POLYMARKET_API_KEY").unwrap_or_default();
     let wallet = env::var("POLYMARKET_WALLET").unwrap_or_default();
     if !api_key.is_empty() && !wallet.is_empty() {
-        let merger = PolyMerger::new(api_key, wallet);
+        let merger = PolyMerger::new(api_key, wallet, true);
         tokio::spawn(merger.run_loop());
         info!("🔄 Poly Merger started (async capital recycling)");
     } else {
@@ -126,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
     
     if use_websocket {
         // Phase 3.6: Hot Switchover WebSocket mode with PnL tracking
-        run_websocket_mode(api.clone(), strategy_tx, pnl_tracker, trading_tx).await?;
+        run_websocket_mode(api.clone(), strategy_tx, pnl_tracker, trading_tx, tracker.clone()).await?;
     } else {
         // Phase 2: REST polling mode
         run_rest_mode(api.clone(), strategy_tx).await?;
@@ -142,8 +147,9 @@ async fn run_rest_mode(
 ) -> anyhow::Result<()> {
     use orderbook::OrderBookTracker;
     
+    // Note: Tracker is created in main() and passed to TradingEngine
+    // Strategy gets its own instance via the engine
     let tracker = Arc::new(OrderBookTracker::new());
-    info!("✅ OrderBookTracker initialized");
     
     let mut strategy = PingpongStrategy::new(
         tracker,
@@ -175,6 +181,7 @@ async fn run_websocket_mode(
     strategy_tx: mpsc::UnboundedSender<StrategyEvent>,
     pnl_tracker: PnlTracker,
     trading_tx: mpsc::UnboundedSender<ArbitrageSignal>,
+    orderbook_tracker: Arc<OrderBookTracker>,
 ) -> anyhow::Result<()> {
     info!("🚀 Starting Hot Switchover WebSocket mode...");
     
@@ -197,8 +204,35 @@ async fn run_websocket_mode(
         }
     }
     
-    // Create shared application state
-    let state = Arc::new(AppState::new());
+    // Create shared application state (use passed tracker for ghost detection)
+    let state = Arc::new(AppState::with_tracker(orderbook_tracker));
+
+    // Periodic market discovery - refresh every 5 minutes
+    let api_refresh = api.clone();
+    let state_refresh = state.clone();
+    tokio::spawn(async move {
+        use tokio::time::Duration;
+        let mut interval = tokio::time::interval(Duration::from_secs(300));
+        loop {
+            interval.tick().await;
+            tracing::info!("Refreshing markets...");
+            if let Ok(markets) = api_refresh.get_markets().await {
+                // Build token_side mapping: token_id -> (condition_id, is_yes)
+                let mut token_side_map = std::collections::HashMap::new();
+                for m in &markets {
+                    if let Some(yes) = m.yes_token_id() {
+                        token_side_map.insert(yes, (m.condition_id.clone(), true));
+                    }
+                    if let Some(no) = m.no_token_id() {
+                        token_side_map.insert(no, (m.condition_id.clone(), false));
+                    }
+                }
+                let count = token_side_map.len();
+                *state_refresh.token_side.lock() = token_side_map;
+                tracing::info!("Found {} markets ({} tokens)", markets.len(), count);
+            }
+        }
+    });
     state.build_token_mapping(&token_mapping);
     
     // Create channel for director to send updates
@@ -225,7 +259,7 @@ async fn run_websocket_mode(
     // 5-min rolling capital cap tracker
     let mut capital_history: Vec<(std::time::Instant, f64)> = Vec::new();
     const CAPITAL_WINDOW_SECS: u64 = 300; // 5 minutes
-    const MAX_CAPITAL_PER_WINDOW: f64 = 75.0; // $250 max per 5-min window
+    const MAX_CAPITAL_PER_WINDOW: f64 = 1000.0; // $250 max per 5-min window
     
     // Process updates from the Trading Director
     let mut scan_count = 0u64;

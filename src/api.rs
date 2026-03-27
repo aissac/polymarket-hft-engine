@@ -62,6 +62,12 @@ pub struct PolyClient {
     gamma_url: String,
 }
 
+impl Clone for PolyClient {
+    fn clone(&self) -> Self {
+        Self { gamma_url: self.gamma_url.clone() }
+    }
+}
+
 impl PolyClient {
     pub fn new() -> Self {
         Self {
