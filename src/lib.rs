@@ -7,6 +7,9 @@ mod orderbook;
 mod api;
 mod strategy;
 mod trading;
+mod maker_hybrid;
+mod simd_hot_path;
+mod hot_path_optimized;
 mod websocket;
 // mod polyfill_integration; // Disabled - polyfill-rs bug
 pub mod production;
@@ -15,6 +18,7 @@ pub use orderbook::OrderBookTracker;
 pub use api::{PolyClient, SimplifiedMarket, TokenData};
 pub use strategy::PingpongStrategy;
 pub use trading::{TradingEngine, TradingConfig, ArbitrageSignal};
+pub use maker_hybrid::{MakerSignal, MakerSide, InventoryTracker, evaluate_maker_opportunity};
 pub use production::{ProductionGuard, CircuitBreaker, LiquidityCheck, GasEstimate, OrderManager, TradeType, TradingStats};
 
 /// Target combined cost - if YES_ask + NO_ask < this, we have arbitrage

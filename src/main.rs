@@ -19,12 +19,15 @@ mod hot_switchover;
 mod pnl;
 mod gabagool_strategy;
 mod merger;
+mod maker_hybrid;
+mod simd_hot_path;
 
 use api::{PolyClient, SimplifiedMarket};
 use websocket::TokenData;
 use orderbook::OrderBookTracker;
 use strategy::{PingpongStrategy, StrategyEvent};
 use trading::{TradingEngine, TradingConfig, start_trading_loop, ArbitrageSignal};
+use maker_hybrid::{MakerSignal, MakerSide, InventoryTracker, evaluate_maker_opportunity};
 use websocket::OrderBookUpdate;
 use hot_switchover::{run_hot_switchover_manager, AppState};
 use pnl::{PnlTracker, create_trade_result};
@@ -294,23 +297,23 @@ async fn run_websocket_mode(
                     // Keep edge for backward compatibility
                     let edge = profit_per_share;
                     
-                    // Sweet spot filter: only combined $0.70-$0.90, edge 10-30%
+                    // Sweet spot filter: combined $0.85-$0.98, edge 3.5%-6%, prefer extreme probs (lower fees)
                     // Lag compensation: During high-volatility periods (price swings),
                         // require higher edge to survive 500ms sequencer delay
                         // Markets with high price velocity will move against us during wait
                         // So we demand more edge as a buffer
                         let price_spread = (yes_price - no_price).abs();
-                        let is_high_vol = price_spread > 0.40 || combined < 0.75 || combined > 0.88;
+                        let is_high_vol = price_spread > 0.40 || combined > 0.95;
                         
                         // Dynamic thresholds: tighter during volatility, normal otherwise
                         let (min_edge, max_combined) = if is_high_vol {
-                            (0.15, 0.88) // Need 15%+ edge, combined ≤ $0.88
+                            (0.05, 0.97) // High vol: 5% edge, combined ≤ $0.97
                         } else {
-                            (0.10, 0.90) // Normal: 10%+ edge, combined ≤ $0.90
+                            (0.035, 0.98) // Normal: 3.5% edge, combined ≤ $0.98
                         };
                         
-                        let in_sweet_spot = combined >= 0.70 && combined <= max_combined;
-                        let good_edge = edge >= min_edge && edge <= 0.35; // widened to capture real edges
+                        let in_sweet_spot = combined >= 0.85 && combined <= max_combined;
+                        let good_edge = edge >= min_edge && edge <= 0.06; // 3.5%-6% edge range (NotebookLM: >6% is noise)
                     
                     // Log periodically (every 5 seconds)
                     if last_log_time.elapsed().as_secs() > 5 {
@@ -403,21 +406,62 @@ async fn run_websocket_mode(
                         let max_depth_shares = (min_depth * 0.80) as i32; // Use 80% of available to leave headroom
                         let shares = base_shares.min(max_depth_shares).max(10);
                         
-                        // HARD CAP: 0 max per trade (notebooklm recommendation)
-                        let max_cap_shares = ((50.0 / combined) as i32).max(10);
+                        // HARD CAP: 100 max per trade (notebooklm recommendation)
+                        let max_cap_shares = ((100.0 / combined) as i32).max(10);
                         let shares = shares.min(max_cap_shares);
                         let shares_f = shares as f64;
-                        let shares_f = shares as f64;
                         
-                        info!(
-                            "🎯 SWEET SPOT ARB! | {} | YES: ${:.4} + NO: ${:.4} = ${:.4} | Edge: {:.1}% | Size: {:.0}",
-                            &condition_id[..8.min(condition_id.len())],
-                            yes_price,
-                            no_price,
-                            combined,
-                            edge * 100.0,
-                            shares_f
-                        );
+                        // ═══════════════════════════════════════════════════════
+                        // MAKER HYBRID CHECK
+                        // Prefer Maker orders on extreme probabilities (p<0.30 or p>0.70)
+                        // This earns 20% rebate instead of paying 1.80% taker fee
+                        // ═══════════════════════════════════════════════════════
+                        let p = yes_price / combined;
+                        let is_extreme_prob = p < 0.30 || p > 0.70;
+                        
+                        // Identify volatile side (lower depth = more volatile)
+                        let (maker_side, maker_price, taker_price) = if yes_depth < no_depth {
+                            // YES is more volatile - post Maker on YES
+                            ("YES", yes_price - 0.01, no_price)
+                        } else {
+                            // NO is more volatile - post Maker on NO
+                            ("NO", no_price - 0.01, yes_price)
+                        };
+                        
+                        // Dynamic fee based on probability
+                        let variance = p * (1.0 - p);
+                        let dynamic_fee = (0.25 * variance * variance).max(0.01);
+                        
+                        // Maker rebate benefit (20% of max taker fee)
+                        let maker_rebate = 0.20 * 0.0156; // ~0.3%
+                        let profit_with_rebate = profit_per_share + maker_rebate;
+                        
+                        if is_extreme_prob {
+                            // Log Maker hybrid opportunity
+                            info!(
+                                "🎯 MAKER HYBRID! | {} | {} @ ${:.4} (Maker) + {} @ ${:.4} (Taker) = ${:.4} | Edge: {:.1}% | Fee: {:.2}% | Net: ${:.4}/sh",
+                                &condition_id[..8.min(condition_id.len())],
+                                maker_side,
+                                maker_price,
+                                if maker_side == "YES" { "NO" } else { "YES" },
+                                taker_price,
+                                combined,
+                                edge * 100.0,
+                                dynamic_fee * 100.0,
+                                profit_with_rebate
+                            );
+                        } else {
+                            // Regular Taker signal for non-extreme probabilities
+                            info!(
+                                "🎯 SWEET SPOT ARB! | {} | YES: ${:.4} + NO: ${:.4} = ${:.4} | Edge: {:.1}% | Size: {:.0}",
+                                &condition_id[..8.min(condition_id.len())],
+                                yes_price,
+                                no_price,
+                                combined,
+                                edge * 100.0,
+                                shares_f
+                            );
+                        }
                         
                         // Calculate profit for minimum trade check
                         // Scale minimum based on shares: require at least $0.10 per share

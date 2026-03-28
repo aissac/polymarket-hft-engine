@@ -29,6 +29,7 @@ const MIN_EDGE: f64 = 0.10; // 10% minimum profit
 
 /// Maximum edge to consider (anything higher is likely stale)
 const MAX_EDGE: f64 = 0.30; // 30% max (beyond this = suspicious)
+const MIN_PRICE: f64 = 0.10; // Minimum price per side
 
 /// Strategy state
 #[derive(Debug, Clone)]
@@ -143,7 +144,7 @@ impl PingpongStrategy {
                             let in_sweet_spot = combined_val >= SWEET_SPOT_MIN && combined_val <= SWEET_SPOT_MAX;
                             
                             // Only trade if in sweet spot AND has reasonable edge (10-30%)
-                            if in_sweet_spot && edge >= MIN_EDGE && edge <= MAX_EDGE {
+                            if in_sweet_spot && edge >= MIN_EDGE && edge <= MAX_EDGE && yes_price >= Some(MIN_PRICE) && no_price >= Some(MIN_PRICE) {
                                 info!(
                                     "🎯 SWEET SPOT ARB: {} | YES: ${:.4} + NO: ${:.4} = ${:.4} | Edge: {:.1}%",
                                     &market.condition_id[..8.min(market.condition_id.len())],

@@ -276,6 +276,14 @@ impl OrderBookTracker {
     pub fn market_count(&self) -> usize {
         self.markets.len()
     }
+    
+    /// Get best asks for a market (for adverse selection tracking)
+    pub fn get_best_asks(&self, condition_id: &str) -> (f64, f64) {
+        match self.markets.get(condition_id) {
+            Some(market) => (market.yes_best_ask.unwrap_or(0.0), market.no_best_ask.unwrap_or(0.0)),
+            None => (0.0, 0.0)
+        }
+    }
 }
 
 impl Default for OrderBookTracker {

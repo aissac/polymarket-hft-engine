@@ -48,7 +48,7 @@ impl Default for TradingConfig {
     fn default() -> Self {
         Self {
             min_profit: 0.01,
-            max_leg_usdc: 50.0,
+            max_leg_usdc: 100.0,
             dry_run: true,
             total_bankroll: 1000.0, // $1000 default
             max_per_market_pct: 0.05, // 5% per market
@@ -190,7 +190,10 @@ impl TradingEngine {
         let no_price = market.no_price().unwrap_or(0.0);
         let combined = yes_price + no_price;
         // Exact EV calculation: Polymarket takes 2% on winnings
-        let profit = 1.0 - combined - (combined * 0.02);  // Keep as approximate for now (will update)
+        let p = yes_price / (yes_price + no_price);
+        let variance = p * (1.0 - p);
+        let dynamic_fee = (0.25 * variance * variance).max(0.01);
+        let profit = 1.0 - combined - dynamic_fee;
         
         if profit <= self.config.min_profit {
             return Ok(OrderResult {
@@ -470,6 +473,34 @@ pub async fn start_trading_loop(
                         result.profit_estimate * result.size, 
                         if ghost_detected { "YES" } else { "NO" });
                     info!("📝 DRY MERGER: Recorded {} YES={} NO={}", &result.market_id[..8.min(result.market_id.len())], result.size, result.size);
+                    
+                    // Track adverse selection: check prices after 10s
+                    let combined_at_fill = signal.market.yes_price().unwrap_or(0.5) + signal.market.no_price().unwrap_or(0.5);
+                    let orderbook = engine.orderbook.clone();
+                    let condition_id = signal.market.condition_id.clone();
+                    let market_id = result.market_id.clone();
+                    let yes_price_fill = signal.market.yes_price().unwrap_or(0.5);
+                    let no_price_fill = signal.market.no_price().unwrap_or(0.5);
+                    
+                    tokio::spawn(async move {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                        
+                        // Get current prices from orderbook
+                        let (yes_ask, no_ask) = orderbook.get_best_asks(&condition_id);
+                        let combined_at_10s = yes_ask + no_ask;
+                        
+                        // Adverse if combined increased by more than 5%
+                        let price_increase = combined_at_10s - combined_at_fill;
+                        let adverse = price_increase > 0.10;
+                        
+                        if adverse {
+                            tracing::warn!(
+                                "⚠️ ADVERSE SELECTION: {} | Fill: ${:.2} -> 10s: ${:.2} | Δ=${:.2}",
+                                &market_id[..8.min(market_id.len())],
+                                combined_at_fill, combined_at_10s, price_increase
+                            );
+                        }
+                    });
                 } else if result.yes_filled || result.no_filled {
                     warn!("⚠️ Partial fill - LEG RISK on {}", result.market_id);
                 }

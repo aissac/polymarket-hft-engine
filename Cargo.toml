@@ -48,3 +48,8 @@ secrecy = "0.8"
 rust_decimal = { version = "1.33", features = ["serde"] }
 rust_decimal_macros = "1.33"
 simd-json = "0.14"
+# Latency optimization
+crossbeam-channel = "0.5"
+minstant = "0.1"
+core_affinity = "0.8"
+

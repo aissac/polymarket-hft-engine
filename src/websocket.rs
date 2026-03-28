@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 /// Polymarket WebSocket URL
@@ -48,6 +49,7 @@ pub struct OrderBookUpdate {
     pub outcome: String,    // "yes" or "no"
     pub price: f64,
     pub size: f64,
+    pub timestamp: std::time::Instant,  // For time-to-ghost tracking
 }
 
 /// Pre-allocated buffer for zero-allocation parsing
@@ -156,6 +158,7 @@ impl WSClient {
             outcome: json["outcome"].as_str().unwrap_or("").to_string(),
             price: json["price"].as_f64().unwrap_or(0.0),
             size: json["size"].as_f64().unwrap_or(0.0),
+            timestamp: std::time::Instant::now(),
         };
         
         Ok(update)
@@ -261,6 +264,7 @@ mod tests {
             outcome: "yes".to_string(),
             price: 0.50,
             size: 100.0,
+            timestamp: std::time::Instant::now(),
         };
         
         assert_eq!(update.price, 0.50);

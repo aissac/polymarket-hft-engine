@@ -103,7 +103,7 @@ impl PolyClient {
         let now = Utc::now();
         
         // Assets to try
-        let assets = ["btc", "eth", "sol", "xrp"];
+        let assets = ["btc", "eth"];
         let periods = self.get_current_periods();
         
         for asset in &assets {
@@ -192,7 +192,19 @@ impl PolyClient {
     /// Check API health
     pub async fn health_check(&self) -> Result<bool> {
         use reqwest::Client;
-        let client = Client::new();
+        
+        // HTTP/2 tuning for Polymarket API (NotebookLM recommendation)
+        // 512KB stream windows for ~469KB WebSocket payloads
+        let client = Client::builder()
+            .http2_prior_knowledge()
+            .http2_initial_stream_window_size(512 * 1024)
+            .http2_initial_connection_window_size(512 * 1024)
+            .pool_max_idle_per_host(20)  // Connection pre-warming
+            .pool_idle_timeout(std::time::Duration::from_secs(300))
+            .tcp_nodelay(true)  // Disable Nagle's algorithm
+            .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
+            .build()
+            .expect("Failed to create HTTP/2 client");
         match client.get(&self.gamma_url).send().await {
             Ok(resp) => Ok(resp.status().is_success()),
             Err(_) => Ok(false),

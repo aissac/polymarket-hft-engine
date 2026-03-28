@@ -7,7 +7,7 @@
 //! 4. Noise filtering and in-flight trade locks
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
@@ -16,11 +16,6 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn, error, debug};
-use std::sync::atomic::{AtomicU64, Ordering};
-
-// Latency tracking (Priority 5)
-static HOT_PATH_LATENCY_NS: AtomicU64 = AtomicU64::new(0);
-static HOT_PATH_COUNT: AtomicU64 = AtomicU64::new(0);
 
 // Re-export OrderBookUpdate from websocket module
 use crate::websocket::OrderBookUpdate;
@@ -537,25 +532,11 @@ async fn maintain_ws_connection(
                 while let Some(msg_result) = ws_stream.next().await {
                     match msg_result {
                         Ok(Message::Text(text)) => {
-                            // Priority 5: Nanosecond latency measurement
-                            let start = std::time::Instant::now();
-                            
                             // Parse orderbook updates (serde_json)
                             if let Ok(updates) = parse_orderbook_update(&text) {
                                 for update in updates {
                                     let _ = event_tx.send(WsEvent::Update(source, update));
                                 }
-                            }
-                            
-                            // Record latency
-                            let elapsed_ns = start.elapsed().as_nanos() as u64;
-                            HOT_PATH_LATENCY_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
-                            let count = HOT_PATH_COUNT.fetch_add(1, Ordering::Relaxed);
-                            
-                            // Log every 1000 messages
-                            if count % 1000 == 0 && count > 0 {
-                                let avg_ns = HOT_PATH_LATENCY_NS.load(Ordering::Relaxed) / count;
-                                info!("📊 Hot path latency: avg={:.2}µs ({} samples)", avg_ns as f64 / 1000.0, count);
                             }
                         }
                         Ok(Message::Ping(data)) => {
@@ -659,7 +640,6 @@ fn parse_orderbook_update(text: &str) -> Result<Vec<OrderBookUpdate>, serde_json
                 outcome,
                 price,
                 size,
-                timestamp: std::time::Instant::now(),
             });
         }
         
@@ -700,7 +680,6 @@ fn parse_orderbook_update(text: &str) -> Result<Vec<OrderBookUpdate>, serde_json
         outcome: "yes".to_string(),
         price,
         size,
-        timestamp: std::time::Instant::now(),
     }])
 }
 

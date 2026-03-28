@@ -33,6 +33,7 @@ pub struct OrderSubmission {
     pub size: f64,
     pub is_maker: bool, // true = post inside spread, false = cross spread
     pub signature: String, // EIP-712 signature
+    pub fee_rate_bps: u64, // NEW: Dynamic fee rate in basis points (required Feb 2026)
 }
 
 /// CLOB order payload (EIP-712 signed)
@@ -50,9 +51,22 @@ pub struct ClobOrder {
     pub signature: String,
     #[serde(rename = "signatureType")]
     pub signature_type: i32, // 0 = EOA, 2 = Gnosis Safe Proxy (gasless)
+    #[serde(rename = "feeRateBps")]
+    pub fee_rate_bps: String, // NEW: Required for crypto markets (Feb 2026)
 }
 
 impl ClobExecutor {
+    /// Calculate dynamic fee rate in basis points
+    /// Formula: fee = C × 0.25 × (p × (1-p))²
+    /// Peak at p=0.5: 0.25 × 0.25 = 0.0156 (1.56% = 156 bps)
+    /// Near extremes: ~0 bps
+    pub fn calculate_fee_bps(price: f64) -> u64 {
+        let p = price.min(1.0).max(0.0); // Clamp to [0, 1]
+        let variance = p * (1.0 - p); // p × (1-p)
+        let fee_rate = 0.25 * variance * variance; // C × 0.25 × (p(1-p))²
+        (fee_rate * 10000.0) as u64 // Convert to basis points
+    }
+
     /// Create pre-warmed executor with HTTP/2 connection pooling
     pub fn new(base_url: &str, api_key: Option<String>) -> Self {
         // Pre-warm HTTP/2 client with connection pooling
@@ -110,6 +124,7 @@ impl ClobExecutor {
             expiration: "0".to_string(),
             signature: submission.signature,
             signature_type: 2, // Gnosis Safe Proxy (gasless)
+            fee_rate_bps: format!("{}", submission.fee_rate_bps),
         };
 
         let url = format!("{}/order", base_url);
