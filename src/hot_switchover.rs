@@ -555,7 +555,7 @@ async fn maintain_ws_connection(
                             // Log every 1000 messages
                             if count % 1000 == 0 && count > 0 {
                                 let avg_ns = HOT_PATH_LATENCY_NS.load(Ordering::Relaxed) / count;
-                                info!("📊 Hot path latency: avg={:.2}µs ({} samples)", avg_ns as f64 / 1000.0, count);
+                                debug!("📊 Hot path latency: avg={:.2}µs ({} samples)", avg_ns as f64 / 1000.0, count);
                             }
                         }
                         Ok(Message::Ping(data)) => {
@@ -610,7 +610,7 @@ fn parse_orderbook_update(text: &str) -> Result<Vec<OrderBookUpdate>, serde_json
     static MSG_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let count = MSG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if count % 500 == 0 {
-        tracing::info!("📥 RAW WS MESSAGE: {}", &text[..text.len().min(500)]);
+        tracing::debug!("📥 RAW WS MESSAGE: {}", &text[..text.len().min(500)]);
     }
     
     // Message is an array - take first element
