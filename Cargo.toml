@@ -6,6 +6,7 @@ edition = "2021"
 [workspace]
 
 [dependencies]
+dotenvy = "0.15"
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
 
@@ -84,3 +85,7 @@ alloy-primitives = "1.5"
 alloy-sol-types = "1.5"
 alloy-signer = "1.0"
 alloy-signer-local = "1.0"
+
+[[bin]]
+name = "hft_pingpong_integrated"
+path = "src/bin/hft_pingpong_integrated.rs"
