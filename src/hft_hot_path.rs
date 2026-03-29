@@ -8,9 +8,21 @@ use crossbeam_channel::Sender;
 use std::time::Duration;
 use std::collections::HashMap;
 
-/// Target combined price for arbitrage (95 cents = $0.95)
-/// With 1.80% taker fee (March 30, 2026), we need 4.0%+ edge
-const EDGE_THRESHOLD_U64: u64 = 950_000;
+/// Target combined price for arbitrage (94 cents = $0.94)
+///
+/// March 30, 2026 Fee Structure:
+/// - Max Taker Fee: 1.80% (at $0.50 probability)
+/// - Maker Rebate: 0.36% (20% of taker)
+/// - Net Fee Burden: 1.44%
+/// - Ghost Drag: ~2.14%
+/// - Total Cost: ~3.58%
+///
+/// At $0.94 combined (6% gross edge):
+/// - Gross Profit: +6.00%
+/// - Fee Burden: -1.44%
+/// - Ghost Drag: -2.14%
+/// - Net EV: +2.42% per trade
+const EDGE_THRESHOLD_U64: u64 = 940_000;
 
 /// Background task for crossbeam channel
 #[derive(Debug, Clone)]
