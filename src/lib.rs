@@ -21,6 +21,7 @@ pub mod execution;
 pub mod merge_worker;
 pub mod stop_loss;
 pub mod state;
+pub mod condition_map;
 pub mod user_ws;
 
 pub use orderbook::OrderBookTracker;
@@ -36,6 +37,7 @@ pub use execution::{submit_order, build_l2_headers, fetch_fee_rate, create_order
 pub use merge_worker::{run_merge_worker, MergeTask};
 pub use stop_loss::{start_stop_loss_timer, execute_fak_order, handle_trade_event};
 pub use state::{ExecutionState as HedgeState, HedgeContext};
+pub use condition_map::{build_condition_map, MARKET_SLUGS};
 pub use user_ws::run_user_ws;
 
 /// Target combined cost - if YES_ask + NO_ask < this, we have arbitrage
