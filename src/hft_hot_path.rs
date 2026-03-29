@@ -1,11 +1,14 @@
 // src/hft_hot_path.rs
 //! HFT Hot Path - Sync Tungstenite WebSocket Processing
+//!
+//! Subscribes to Polymarket CLOB WebSocket and processes orderbook updates
+//! with sub-microsecond latency using sync tungstenite.
 
 use crossbeam_channel::Sender;
 use std::time::Duration;
 use std::collections::HashMap;
 
-/// Target combined price for arbitrage (95 cents)
+/// Target combined price for arbitrage (95 cents = $0.95)
 const EDGE_THRESHOLD_U64: u64 = 950_000;
 
 /// Background task for crossbeam channel
@@ -16,14 +19,23 @@ pub enum BackgroundTask {
         combined_price: u64,
         timestamp_nanos: u64,
     },
+    LatencyStats {
+        min_ns: u64,
+        max_ns: u64,
+        avg_ns: u64,
+        p99_ns: u64,
+        sample_count: u64,
+    },
 }
 
 /// Run the synchronous hot path
 pub fn run_sync_hot_path(tx: Sender<BackgroundTask>, tokens: Vec<String>) {
     use tungstenite::{connect, Message};
     
-    // Connect to Polymarket WebSocket
+    // Connect to Polymarket CLOB WebSocket
     let ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+    
+    println!("[HFT] Connecting to {}...", ws_url);
     
     let (mut socket, response) = match connect(ws_url) {
         Ok((s, r)) => (s, r),
@@ -36,29 +48,39 @@ pub fn run_sync_hot_path(tx: Sender<BackgroundTask>, tokens: Vec<String>) {
     println!("✅ Primary WebSocket connected (sync)");
     println!("HTTP status: {}", response.status());
 
-    // Subscribe to tokens
-    let sub_msg = serde_json::json!({
-        "type": "subscribe",
-        "assets_ids": tokens
+    // Subscribe using the CORRECT format from old binary
+    // {"type": "market", "operation": "subscribe", "markets": [], "assets_ids": [...], "initial_dump": true}
+    let subscribe_msg = serde_json::json!({
+        "type": "market",
+        "operation": "subscribe",
+        "markets": [],
+        "assets_ids": tokens,
+        "initial_dump": true
     });
     
-    let _ = socket.write_message(Message::Text(sub_msg.to_string()));
-    println!("📡 Subscribed to {} tokens", tokens.len());
-    println!("[HFT] 🔥 Starting UNIFIED busy-poll loop...");
+    let msg_str = serde_json::to_string(&subscribe_msg).expect("Failed to serialize subscription");
+    let _ = socket.write_message(Message::Text(msg_str.into()));
+    
+    println!("📡 Subscribed to tokens");
+    println!("[HFT] 🔥 Starting UNIFIED busy-poll loop (non-blocking from start)...");
+    println!("[HFT] Batch size: 4096 (~5.1s at 800 msg/sec)");
 
-    // Local orderbook
+    // Local orderbook: token_hash -> (yes_price, no_price, yes_size, no_size)
     let mut orderbook: HashMap<u64, (u64, u64, u64, u64)> = HashMap::with_capacity(128);
     
-    // Latency tracking
-    let mut latency_samples: Vec<u64> = Vec::with_capacity(4096);
+    // Warmup counter
+    let mut warmup_count = 0;
+    
+    // Latency tracking (8192 samples = ~10 seconds)
+    let mut latency_samples: Vec<u64> = Vec::with_capacity(8192);
     let mut last_stat_time = std::time::Instant::now();
 
-    // Main loop
+    // Main busy-poll loop
     loop {
         let msg = match socket.read() {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("WS Read Error: {:?}", e);
+                eprintln!("[HFT] WS Read Error: {:?}", e);
                 std::thread::sleep(Duration::from_millis(100));
                 continue;
             }
@@ -69,13 +91,21 @@ pub fn run_sync_hot_path(tx: Sender<BackgroundTask>, tokens: Vec<String>) {
             let len = text.len();
 
             // Skip pong messages
-            if len < 10 || text.starts_with("pong") {
+            if len < 10 || text.starts_with("pong") || text.starts_with("{\"type\":\"pong\"") {
                 continue;
+            }
+
+            // Warmup period (first 50 messages)
+            if warmup_count < 50 {
+                warmup_count += 1;
+                if warmup_count == 50 {
+                    println!("[HFT] ✅ Warmed up after 50 messages");
+                }
             }
 
             // Parse JSON
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-                // Extract market data
+                // Try price_changes format (market updates)
                 if let (Some(asset_id), Some(price_changes)) = (
                     value.get("asset_id").and_then(|v| v.as_str()),
                     value.get("price_changes").and_then(|v| v.as_array())
@@ -111,6 +141,45 @@ pub fn run_sync_hot_path(tx: Sender<BackgroundTask>, tokens: Vec<String>) {
                         }
                     }
                 }
+                
+                // Try bids/asks format (orderbook snapshot)
+                if let (Some(market), Some(bids), Some(asks)) = (
+                    value.get("market").and_then(|v| v.as_str()),
+                    value.get("bids").and_then(|v| v.as_array()),
+                    value.get("asks").and_then(|v| v.as_array())
+                ) {
+                    let market_hash = fast_hash(market.as_bytes());
+                    
+                    // Extract best bid/ask
+                    if let Some(best_bid) = bids.first() {
+                        if let (Some(price), Some(size)) = (
+                            best_bid.get("price").and_then(|v| v.as_str()),
+                            best_bid.get("size").and_then(|v| v.as_str())
+                        ) {
+                            let price_fixed = parse_fixed_6(price.as_bytes());
+                            let size_fixed = parse_fixed_6(size.as_bytes());
+                            orderbook.entry(market_hash)
+                                .and_modify(|(_, _, s, _)| *s = size_fixed)
+                                .or_insert((price_fixed, 0, size_fixed, 0));
+                        }
+                    }
+                    
+                    if let Some(best_ask) = asks.first() {
+                        if let (Some(price), Some(size)) = (
+                            best_ask.get("price").and_then(|v| v.as_str()),
+                            best_ask.get("size").and_then(|v| v.as_str())
+                        ) {
+                            let price_fixed = parse_fixed_6(price.as_bytes());
+                            let size_fixed = parse_fixed_6(size.as_bytes());
+                            orderbook.entry(market_hash)
+                                .and_modify(|(_, p, _, s)| {
+                                    *p = price_fixed;
+                                    *s = size_fixed;
+                                })
+                                .or_insert((0, price_fixed, 0, size_fixed));
+                        }
+                    }
+                }
             }
 
             // Track latency
@@ -129,15 +198,16 @@ pub fn run_sync_hot_path(tx: Sender<BackgroundTask>, tokens: Vec<String>) {
                     let avg = sum / sorted.len() as u64;
                     let p99_idx = ((sorted.len() as f64) * 0.99) as usize;
                     let p99 = sorted[p99_idx.min(sorted.len() - 1)];
+                    let sample_count = sorted.len();
 
-                    println!(
-                        "[HFT] 🔥 5s STATS | avg={:.2}µs min={:.2}µs max={:.2}µs p99={:.2}µs | {} samples",
-                        avg as f64 / 1000.0,
-                        min as f64 / 1000.0,
-                        max as f64 / 1000.0,
-                        p99 as f64 / 1000.0,
-                        sorted.len()
-                    );
+                    // Send to background thread for logging
+                    let _ = tx.try_send(BackgroundTask::LatencyStats {
+                        min_ns: min,
+                        max_ns: max,
+                        avg_ns: avg,
+                        p99_ns: p99,
+                        sample_count: sample_count as u64,
+                    });
                 }
 
                 latency_samples.clear();
@@ -147,7 +217,7 @@ pub fn run_sync_hot_path(tx: Sender<BackgroundTask>, tokens: Vec<String>) {
     }
 }
 
-/// FNV-1a fast hash
+/// FNV-1a fast hash for token IDs
 #[inline(always)]
 fn fast_hash(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -159,6 +229,7 @@ fn fast_hash(bytes: &[u8]) -> u64 {
 }
 
 /// Zero-allocation fixed-point parser
+/// Converts "0.67" to 670000 (6 decimal places)
 #[inline(always)]
 fn parse_fixed_6(bytes: &[u8]) -> u64 {
     let mut val: u64 = 0;
@@ -179,6 +250,7 @@ fn parse_fixed_6(bytes: &[u8]) -> u64 {
         }
     }
 
+    // Normalize to exactly 6 decimal places
     while fraction_digits < 6 {
         val *= 10;
         fraction_digits += 1;
