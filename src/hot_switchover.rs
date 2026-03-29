@@ -770,7 +770,7 @@ async fn start_trading_director(
                 
                 // Check for ghost liquidity (depth vanished during queue)
                 if state.tracker.check_ghost_liquidity(&market_id) {
-                    tracing::warn!("👻 GHOST LIQUIDITY: {} - skipping update (depth vanished during queue)", &market_id[..8.min(market_id.len())]);
+                    tracing::debug!("👻 GHOST LIQUIDITY: {} - skipping update (depth vanished during queue)", &market_id[..8.min(market_id.len())]);
                     continue;
                 }
                 

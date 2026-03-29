@@ -73,7 +73,7 @@ impl MarketPrices {
                 let ghost_detected = yes_ghost || no_ghost;
                 
                 // Always log the comparison for debugging
-                tracing::info!(
+                tracing::debug!(
                     "🔍 GHOST CHECK: {} | YES: {:.2} -> {:.2} (filled {:.0}, ghost {:.2}) | NO: {:.2} -> {:.2} (filled {:.0}, ghost {:.2}) | ghost={}",
                     &self.condition_id[..8.min(self.condition_id.len())],
                     start_yes, self.yes_depth, filled_size, yes_ghost_volume,
@@ -82,7 +82,7 @@ impl MarketPrices {
                 );
                 
                 if ghost_detected {
-                    tracing::warn!(
+                    tracing::debug!(
                         "👻 GHOST DETECTED: {} | YES ghost: {:.2} | NO ghost: {:.2} | filled: {:.0}",
                         &self.condition_id[..8.min(self.condition_id.len())],
                         yes_ghost_volume, no_ghost_volume, filled_size
@@ -105,7 +105,7 @@ impl MarketPrices {
                 let ghost_detected = yes_vanished || no_vanished;
                 
                 // Always log the comparison for debugging
-                tracing::info!(
+                tracing::debug!(
                     "🔍 GHOST CHECK: {} | YES: {:.2} vs {:.2} ({}%) | NO: {:.2} vs {:.2} ({}%) | ghost={}",
                     &self.condition_id[..8.min(self.condition_id.len())],
                     start_yes, self.yes_depth,
@@ -116,7 +116,7 @@ impl MarketPrices {
                 );
                 
                 if ghost_detected {
-                    tracing::warn!(
+                    tracing::debug!(
                         "👻 GHOST DETECTED: {} | YES: {:.2} -> {:.2} | NO: {:.2} -> {:.2}",
                         &self.condition_id[..8.min(self.condition_id.len())],
                         start_yes, self.yes_depth,
