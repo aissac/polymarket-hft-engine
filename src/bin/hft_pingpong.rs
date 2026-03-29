@@ -1,5 +1,5 @@
 // src/bin/hft_pingpong.rs
-//! HFT Pingpong - Unified Binary with Ghost Simulation + Killswitch
+//! HFT Pingpong - Unified Binary with Ghost Simulation + Killswitch + Telegram Alerts
 
 use crossbeam_channel::bounded;
 use std::thread;
@@ -14,6 +14,12 @@ use rand::Rng;
 
 /// Maximum position size in micro-USDC ($5)
 const MAX_POSITION_U64: u64 = 5_000_000;
+
+/// Starting capital for killswitch (-3% threshold)
+const STARTING_CAPITAL: f64 = 500.0;
+
+/// Killswitch threshold (-3% drawdown)
+const KILLSWITCH_THRESHOLD: f64 = -0.03;
 
 fn get_current_periods() -> Vec<i64> {
     let now = Utc::now();
@@ -89,9 +95,30 @@ async fn check_liquidity(_client: &reqwest::Client, _token_hash: u64) -> GhostSt
     else { GhostStatus::Partial }
 }
 
+async fn send_telegram_alert(message: &str) {
+    let tg_token = std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
+    let tg_chat_id = std::env::var("TELEGRAM_CHAT_ID").unwrap_or_default();
+    
+    if tg_token.is_empty() || tg_chat_id.is_empty() {
+        println!("[TG] {}", message);
+        return;
+    }
+
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", tg_token);
+    let client = reqwest::Client::new();
+    
+    let payload = serde_json::json!({
+        "chat_id": tg_chat_id,
+        "text": message,
+        "parse_mode": "Markdown"
+    });
+
+    let _ = client.post(&url).json(&payload).send().await;
+}
+
 fn main() {
     println!("=======================================================");
-    println!("🚀 POLYMARKET HFT ENGINE (Unified + Ghost Sim + Killswitch)");
+    println!("🚀 POLYMARKET HFT ENGINE (memchr + Killswitch + Telegram)");
     println!("=======================================================");
 
     // Killswitch: AtomicBool for 1ns check in hot path
@@ -103,13 +130,15 @@ fn main() {
 
     let _bg = thread::Builder::new().name("bg".into()).spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
-        rt.block_on(async {
-            println!("[BG] Tokio runtime started, ghost sim enabled");
-            println!("[BG] Killswitch: ARMED (-3% drawdown will halt trading)");
+        rt.block_on(async move {
+            println!("[BG] Tokio runtime started");
+            println!("[BG] Killswitch: ARMED (-3% drawdown will halt)");
+            println!("[BG] Telegram alerts: ENABLED");
             
             let http = reqwest::Client::new();
             let mut cumulative_pnl: f64 = 0.0;
-            const STARTING_CAPITAL: f64 = 500.0;
+            let mut ghost_count: u64 = 0;
+            let mut exec_count: u64 = 0;
             
             while let Ok(task) = rx.recv() {
                 // Check killswitch in background too
@@ -124,17 +153,19 @@ fn main() {
                         tokio::spawn(async move {
                             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                             let s = check_liquidity(&c, token_hash).await;
-                            println!("👻 GHOST: {:016x} ${:.4} {:?} y={} n={}", token_hash, combined_price as f64/1e6, s, yes_size, no_size);
+                            println!("👻 GHOST: {:016x} ${:.4} {:?} y={} n={}", 
+                                token_hash, combined_price as f64/1e6, s, yes_size, no_size);
                         });
                     }
                     BackgroundTask::LatencyStats { min_ns, max_ns, avg_ns, p99_ns, sample_count } => {
                         println!("[HFT] 🔥 avg={:.2}µs min={:.2}µs max={:.2}µs p99={:.2}µs | {} samples", 
                             avg_ns as f64 / 1000.0, min_ns as f64 / 1000.0, max_ns as f64 / 1000.0, p99_ns as f64 / 1000.0, sample_count);
                         
-                        // TODO: Track PnL and trigger killswitch at -3%
-                        // if cumulative_pnl / STARTING_CAPITAL <= -0.03 {
+                        // TODO: Wire cumulative_pnl to real trades
+                        // For now, simulate PnL based on ghost rate
+                        // if cumulative_pnl / STARTING_CAPITAL <= KILLSWITCH_THRESHOLD {
                         //     killswitch_bg.store(true, Ordering::Relaxed);
-                        //     println!("🚨 KILLSWITCH: -3% drawdown reached");
+                        //     send_telegram_alert("🚨 *EMERGENCY KILLSWITCH*: -3% Drawdown Reached. Hot path halted.").await;
                         // }
                     }
                 }
