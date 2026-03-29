@@ -207,7 +207,7 @@ fn main() {
     // ============================================================
     // 2. BUILD CONDITION MAP (async - needs temp tokio runtime)
     // ============================================================
-    let http_client = Arc::new(reqwest::Client::new());
+    let http_client = Arc::new(execution::build_hft_client());
     let condition_map = tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(build_condition_map(&http_client, MARKET_SLUGS));
@@ -311,6 +311,9 @@ fn main() {
     }
 
     // ============================================================
+    // Pre-warm HTTP/2 connections (NotebookLM Fix #4)
+    tokio::runtime::Runtime::new().unwrap().block_on(execution::pre_warm_connections(&http_client));
+
     // 6. FETCH TOKENS WITH CORRECT YES/NO PAIRS
     // ============================================================
     let (tokens, token_pairs, token_strings): (Vec<String>, HashMap<u64, u64>, HashMap<u64, String>) = 

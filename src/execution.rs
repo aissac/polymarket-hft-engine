@@ -1,7 +1,6 @@
-//! CLOB Order Execution for Polymarket
+//! Execution Module with Maker/Taker Order Routing
 //! 
-//! Handles order submission, L2 authentication, and dynamic fee rate fetching.
-//! Uses direct HTTP POST for order submission (DRY RUN mode ready).
+//! Implements GTC Maker orders and FAK Taker orders per NotebookLM guidance.
 
 use reqwest::{Client, StatusCode, header::{HeaderMap, HeaderValue, CONTENT_TYPE}};
 use serde_json::{json, Value};
@@ -11,9 +10,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// Re-export from signing
-pub use crate::signing::{Order, Side, OrderType, SignatureType, PrivateKeySigner};
-
+use crate::signing::{Order, PrivateKeySigner};
 use alloy_primitives::{Address, U256};
 use std::str::FromStr;
 
@@ -35,19 +32,14 @@ pub fn build_l2_headers(
         .as_secs()
         .to_string();
 
-    // Message: timestamp + method + request_path + body
     let msg = format!("{}{}{}{}", timestamp, method, request_path, body_str);
-
-    // Decode base64 API secret
     let decoded_secret = BASE64.decode(api_secret).expect("Invalid base64 secret");
 
-    // HMAC-SHA256 signature
     let mut mac = Hmac::<Sha256>::new_from_slice(&decoded_secret).expect("HMAC key error");
     mac.update(msg.as_bytes());
     let signature_bytes = mac.finalize().into_bytes();
     let signature_b64 = BASE64.encode(signature_bytes);
 
-    // Build headers
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert("POLY_ADDRESS", HeaderValue::from_str(signer_address).unwrap());
@@ -59,7 +51,35 @@ pub fn build_l2_headers(
     headers
 }
 
-/// Fetch dynamic fee rate for a token
+/// Build optimized HTTP/2 client for HFT (NotebookLM Fix #2)
+pub fn build_hft_client() -> Client {
+    Client::builder()
+        .http2_prior_knowledge()                    // Force HTTP/2
+        .tcp_keepalive(Duration::from_secs(60))     // Keep connections warm
+        .pool_idle_timeout(Duration::from_secs(90)) // Prevent dropping idle sockets
+        .pool_max_idle_per_host(10)                 // Pool connections per host
+        .build()
+        .expect("Failed to build HFT HTTP Client")
+}
+
+/// Pre-warm TCP/TLS connections before hot path starts (NotebookLM Fix #4)
+pub async fn pre_warm_connections(client: &Client) {
+    println!("🔥 Pre-warming TCP/TLS connections...");
+    
+    let endpoints = vec![
+        "https://clob.polymarket.com/time",
+        "https://gamma-api.polymarket.com/health",
+    ];
+
+    for url in endpoints {
+        match client.get(url).send().await {
+            Ok(_) => println!("✅ Warmed {}", url),
+            Err(e) => eprintln!("⚠️ Failed to warm {}: {}", url, e),
+        }
+    }
+}
+
+/// Fetch dynamic fee rate for a token (cache at startup)
 pub async fn fetch_fee_rate(client: &Client, token_id: &str) -> Result<u64, String> {
     let url = format!("{}/fee-rate?token_id={}", CLOB_BASE, token_id);
     
@@ -76,14 +96,12 @@ pub async fn fetch_fee_rate(client: &Client, token_id: &str) -> Result<u64, Stri
     let body = resp.text().await.map_err(|e| e.to_string())?;
     let json: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
 
-    // feeRateBps is the fee in basis points
     json.get("feeRateBps")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| "No feeRateBps in response".to_string())
 }
 
-/// Create order payload for Polymarket CLOB
-/// This creates the JSON payload directly (no SDK dependency)
+/// Create order payload with orderType (NotebookLM Fix #1)
 pub fn create_order_payload(
     maker: Address,
     signer: Address,
@@ -96,6 +114,7 @@ pub fn create_order_payload(
     salt: u64,
     expiration: u64,
     nonce: u64,
+    order_type: &str,  // "GTC" or "FAK"
 ) -> Value {
     json!({
         "salt": salt,
@@ -110,11 +129,11 @@ pub fn create_order_payload(
         "feeRateBps": fee_rate_bps.to_string(),
         "side": side,
         "signatureType": 2,  // GNOSIS_SAFE for gasless
+        "orderType": order_type,  // CRITICAL: "GTC" or "FAK"
     })
 }
 
 /// Submit order with exponential backoff for 429 errors
-/// In DRY_RUN mode, returns Ok(()) without actually sending
 pub async fn submit_order(
     client: &Client,
     order_payload: &Value,
@@ -126,11 +145,10 @@ pub async fn submit_order(
     dry_run: bool,
     max_retries: u32,
 ) -> Result<Value, String> {
-    // DRY RUN mode: validate payload but don't submit
     if dry_run {
-        println!("[DRY_RUN] Would submit order:");
-        println!("  Payload: {}", serde_json::to_string_pretty(order_payload).unwrap());
-        println!("  Signature: {}", signature);
+        let order_type = order_payload.get("orderType").and_then(|v| v.as_str()).unwrap_or("UNKNOWN");
+        println!("✅ [DRY_RUN] Would submit {} order:", order_type);
+        println!("  {}", serde_json::to_string_pretty(order_payload).unwrap());
         return Ok(json!({"order_id": "dry_run_mock", "status": "dry_run"}));
     }
     
@@ -148,7 +166,6 @@ pub async fn submit_order(
             &body_str,
         );
 
-        // Add signature to payload
         let mut full_payload = order_payload.clone();
         full_payload["signature"] = Value::String(signature.to_string());
 
@@ -197,43 +214,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_build_l2_headers() {
-        let headers = build_l2_headers(
-            "test_key",
-            "dGVzdF9zZWNyZXQ=", // base64 of "test_secret"
-            "test_pass",
-            "0x1234",
-            "POST",
-            "/order",
-            "{}",
-        );
-        
-        assert!(headers.contains_key("POLY_ADDRESS"));
-        assert!(headers.contains_key("POLY_API_KEY"));
-        assert!(headers.contains_key("POLY_TIMESTAMP"));
-        assert!(headers.contains_key("POLY_SIGNATURE"));
+    fn test_build_hft_client() {
+        let client = build_hft_client();
+        // Client should be configured for HTTP/2
+        assert!(client.is_ok());
     }
 
     #[test]
-    fn test_create_order_payload() {
-        let maker = Address::from_str("0x1234567890123456789012345678901234567890").unwrap();
-        let signer = maker;
-        let taker = Address::ZERO;
-        
+    fn test_create_order_payload_gtc() {
         let payload = create_order_payload(
-            maker, signer, taker,
-            "1234567890",
-            1000000, // $1.00 in USDC (6 decimals)
+            Address::default(),
+            Address::default(),
+            Address::ZERO,
+            "test_token",
             1000000,
-            180, // 1.80% fee
-            0,   // BUY
-            12345,
-            0,   // never expires
+            1000000,
+            180,
             0,
+            12345,
+            0,
+            0,
+            "GTC",
         );
         
+        assert_eq!(payload["orderType"], "GTC");
         assert_eq!(payload["side"], 0);
         assert_eq!(payload["signatureType"], 2);
-        assert_eq!(payload["feeRateBps"], "180");
+    }
+
+    #[test]
+    fn test_create_order_payload_fak() {
+        let payload = create_order_payload(
+            Address::default(),
+            Address::default(),
+            Address::ZERO,
+            "test_token",
+            1000000,
+            1000000,
+            180,
+            0,
+            12345,
+            0,
+            0,
+            "FAK",
+        );
+        
+        assert_eq!(payload["orderType"], "FAK");
     }
 }

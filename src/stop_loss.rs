@@ -94,6 +94,7 @@ pub async fn execute_fak_order(
         generate_salt(),
         0, // never expires
         0, // nonce
+        "FAK", // order_type for stop-loss
     );
 
     if dry_run {
