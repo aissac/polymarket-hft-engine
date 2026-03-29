@@ -13,6 +13,7 @@ tokio = { version = "1.35", features = ["full"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 url = "2.5"
 tungstenite = "0.24"
+memchr = "2.7"
 futures-util = { version = "0.3", default-features = false, features = ["std", "tokio-io"] }
 
 # HTTP client
