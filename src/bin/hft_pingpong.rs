@@ -1,14 +1,20 @@
 // src/bin/hft_pingpong.rs
 //! HFT Pingpong - Unified Binary (Hot Path + Background Thread)
+//! 
+//! CRITICAL FIX: Token pair mapping instead of XOR trick
 
 use crossbeam_channel::bounded;
 use std::thread;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::collections::HashMap;
 use chrono::{Utc, Timelike};
 
 use pingpong::hft_hot_path::run_sync_hot_path;
 use pingpong::hft_hot_path::BackgroundTask;
+
+/// Token pair map: YES hash -> NO hash, NO hash -> YES hash
+type TokenPairs = HashMap<u64, u64>;
 
 /// Simplified market info
 #[derive(Debug, Clone)]
@@ -27,7 +33,7 @@ fn get_current_periods() -> Vec<i64> {
     vec![base_ts, base_ts - 900, base_ts + 900]
 }
 
-/// Fetch a single market by slug (same logic as old binary)
+/// Fetch a single market by slug
 async fn fetch_market_by_slug(client: &reqwest::Client, slug: &str, now: &chrono::DateTime<Utc>) -> Option<MarketInfo> {
     let url = format!("https://gamma-api.polymarket.com/markets?slug={}", slug);
     
@@ -39,17 +45,14 @@ async fn fetch_market_by_slug(client: &reqwest::Client, slug: &str, now: &chrono
     let markets: Vec<serde_json::Value> = resp.json().await.ok()?;
     let market = markets.into_iter().next()?;
     
-    // Parse end date
     let end_date_str = market.get("endDate")?.as_str()?;
     let end_date = chrono::DateTime::parse_from_rfc3339(end_date_str).ok()?.with_timezone(&Utc);
     let hours_until_resolve = (end_date - *now).num_hours();
     
-    // Skip if already resolved or more than 1 hour away
     if hours_until_resolve < 0 || hours_until_resolve > 1 {
         return None;
     }
     
-    // Get token IDs from clobTokenIds (JSON string)
     let token_ids_str = market.get("clobTokenIds")?.as_str()?;
     let token_ids: Vec<String> = serde_json::from_str(token_ids_str).ok()?;
     
@@ -64,12 +67,23 @@ async fn fetch_market_by_slug(client: &reqwest::Client, slug: &str, now: &chrono
     })
 }
 
-/// Fetch tokens from Gamma API
-async fn fetch_tokens() -> Vec<String> {
+/// FNV-1a fast hash for token IDs (same as hot path)
+fn fast_hash(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Fetch tokens AND build token pair mapping
+async fn fetch_tokens_with_pairs() -> (Vec<String>, TokenPairs) {
     println!("📊 Fetching BTC/ETH Up/Down markets from REST API...");
     
     let client = reqwest::Client::new();
     let mut all_tokens: Vec<String> = Vec::new();
+    let mut token_pairs: TokenPairs = HashMap::new();
     let now = Utc::now();
     
     let assets = ["btc", "eth"];
@@ -80,23 +94,45 @@ async fn fetch_tokens() -> Vec<String> {
             // Try 15m market
             let slug_15m = format!("{}-updown-15m-{}", asset, period_ts);
             if let Some(market) = fetch_market_by_slug(&client, &slug_15m, &now).await {
-                all_tokens.extend(market.token_ids);
+                if market.token_ids.len() >= 2 {
+                    // Build token pair mapping
+                    let yes_token = &market.token_ids[0];
+                    let no_token = &market.token_ids[1];
+                    let yes_hash = fast_hash(yes_token.as_bytes());
+                    let no_hash = fast_hash(no_token.as_bytes());
+                    
+                    // Map both directions
+                    token_pairs.insert(yes_hash, no_hash);
+                    token_pairs.insert(no_hash, yes_hash);
+                    
+                    all_tokens.extend(market.token_ids);
+                }
             }
             
             // Try 5m market
             let slug_5m = format!("{}-updown-5m-{}", asset, period_ts - 600);
             if let Some(market) = fetch_market_by_slug(&client, &slug_5m, &now).await {
-                all_tokens.extend(market.token_ids);
+                if market.token_ids.len() >= 2 {
+                    let yes_token = &market.token_ids[0];
+                    let no_token = &market.token_ids[1];
+                    let yes_hash = fast_hash(yes_token.as_bytes());
+                    let no_hash = fast_hash(no_token.as_bytes());
+                    
+                    token_pairs.insert(yes_hash, no_hash);
+                    token_pairs.insert(no_hash, yes_hash);
+                    
+                    all_tokens.extend(market.token_ids);
+                }
             }
         }
     }
     
-    // Deduplicate
     all_tokens.sort();
     all_tokens.dedup();
     
-    println!("📊 Fetched {} tokens from {} markets", all_tokens.len(), all_tokens.len() / 2);
-    all_tokens
+    println!("📊 Fetched {} tokens, {} pairs", all_tokens.len(), token_pairs.len() / 2);
+    
+    (all_tokens, token_pairs)
 }
 
 fn main() {
@@ -104,14 +140,12 @@ fn main() {
     println!("🚀 POLYMARKET HFT ENGINE (memchr + Killswitch + Telegram)");
     println!("=======================================================");
 
-    // Killswitch: AtomicBool for 1ns check in hot path
     let killswitch = Arc::new(AtomicBool::new(false));
     let killswitch_hot = Arc::clone(&killswitch);
 
-    // 1. Create the lock-free bridge
     let (tx, rx) = bounded(65536);
 
-    // 2. Spawn Background Thread (Ghost Simulation + Telegram)
+    // Background thread for ghost simulation + Telegram
     let _bg_handle = thread::Builder::new()
         .name("background-dispatcher".into())
         .spawn(move || {
@@ -128,8 +162,7 @@ fn main() {
                 while let Ok(task) = rx.recv() {
                     match task {
                         BackgroundTask::EdgeDetected { token_hash, combined_price, yes_size, no_size, .. } => {
-                            // Ghost simulation would go here
-                            println!("📊 Edge: hash={:016x} combined=${:.4} yes={} no={}", 
+                            println!("[BG] 📊 Edge: hash={:016x} combined=${:.4} yes={} no={}", 
                                 token_hash, 
                                 combined_price as f64 / 1_000_000.0,
                                 yes_size,
@@ -152,7 +185,7 @@ fn main() {
         })
         .expect("Failed to spawn background thread");
 
-    // 3. Pin Hot Path to isolated CPU core
+    // Pin to CPU 1
     #[cfg(target_os = "linux")]
     {
         use std::mem::size_of;
@@ -165,21 +198,21 @@ fn main() {
         }
     }
 
-    // 4. Get tokens from Gamma API
-    let tokens: Vec<String> = tokio::runtime::Runtime::new()
+    // Fetch tokens with pair mapping
+    let (tokens, token_pairs): (Vec<String>, TokenPairs) = tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(fetch_tokens());
+        .block_on(fetch_tokens_with_pairs());
 
     if tokens.is_empty() {
         eprintln!("❌ No tokens fetched, exiting");
         std::process::exit(1);
     }
 
-    println!("🚀 Starting HFT hot path... 📡 {} tokens", tokens.len());
+    println!("🚀 Starting HFT hot path... 📡 {} tokens, {} pairs", tokens.len(), token_pairs.len());
     println!("💰 Max position: $5.00 per trade");
 
-    // 5. Run Hot Path with Killswitch
-    run_sync_hot_path(tx, tokens, killswitch_hot);
+    // Pass token_pairs to hot path
+    run_sync_hot_path(tx, tokens, killswitch_hot, token_pairs);
 
     eprintln!("🚨 Hot path exited");
     std::process::exit(1);
