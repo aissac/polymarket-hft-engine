@@ -1,26 +1,22 @@
 // src/bin/hft_pingpong.rs
-//! HFT Pingpong - Unified Binary with Ghost Simulation + Killswitch + Telegram Alerts
+//! HFT Pingpong - Unified Binary (Hot Path + Background Thread)
 
 use crossbeam_channel::bounded;
 use std::thread;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use chrono::{Utc, Timelike};
 
 use pingpong::hft_hot_path::run_sync_hot_path;
 use pingpong::hft_hot_path::BackgroundTask;
-use pingpong::hft_hot_path::GhostStatus;
-use rand::Rng;
 
-/// Maximum position size in micro-USDC ($5)
-const MAX_POSITION_U64: u64 = 5_000_000;
+/// Simplified market info
+#[derive(Debug, Clone)]
+struct MarketInfo {
+    condition_id: String,
+    token_ids: Vec<String>,
+    hours_until_resolve: i64,
+}
 
-/// Starting capital for killswitch (-3% threshold)
-const STARTING_CAPITAL: f64 = 500.0;
-
-/// Killswitch threshold (-3% drawdown)
-const KILLSWITCH_THRESHOLD: f64 = -0.03;
-
+/// Get current 15-minute periods for market slugs
 fn get_current_periods() -> Vec<i64> {
     let now = Utc::now();
     let minute = (now.minute() / 15) * 15;
@@ -29,23 +25,35 @@ fn get_current_periods() -> Vec<i64> {
     vec![base_ts, base_ts - 900, base_ts + 900]
 }
 
+/// Fetch a single market by slug (same logic as old binary)
 async fn fetch_market_by_slug(client: &reqwest::Client, slug: &str, now: &chrono::DateTime<Utc>) -> Option<MarketInfo> {
     let url = format!("https://gamma-api.polymarket.com/markets?slug={}", slug);
+    
     let resp = client.get(&url).send().await.ok()?;
-    if !resp.status().is_success() { return None; }
+    if !resp.status().is_success() {
+        return None;
+    }
     
     let markets: Vec<serde_json::Value> = resp.json().await.ok()?;
     let market = markets.into_iter().next()?;
     
+    // Parse end date
     let end_date_str = market.get("endDate")?.as_str()?;
     let end_date = chrono::DateTime::parse_from_rfc3339(end_date_str).ok()?.with_timezone(&Utc);
     let hours_until_resolve = (end_date - *now).num_hours();
     
-    if hours_until_resolve < 0 || hours_until_resolve > 1 { return None; }
+    // Skip if already resolved or more than 1 hour away
+    if hours_until_resolve < 0 || hours_until_resolve > 1 {
+        return None;
+    }
     
+    // Get token IDs from clobTokenIds (JSON string)
     let token_ids_str = market.get("clobTokenIds")?.as_str()?;
     let token_ids: Vec<String> = serde_json::from_str(token_ids_str).ok()?;
-    if token_ids.len() < 2 || token_ids[0].is_empty() { return None; }
+    
+    if token_ids.len() < 2 || token_ids[0].is_empty() {
+        return None;
+    }
     
     Some(MarketInfo {
         condition_id: market.get("conditionId")?.as_str()?.to_string(),
@@ -54,143 +62,114 @@ async fn fetch_market_by_slug(client: &reqwest::Client, slug: &str, now: &chrono
     })
 }
 
+/// Fetch tokens from Gamma API
 async fn fetch_tokens() -> Vec<String> {
-    println!("📊 Fetching BTC/ETH Up/Down markets...");
+    println!("📊 Fetching BTC/ETH Up/Down markets from REST API...");
+    
     let client = reqwest::Client::new();
     let mut all_tokens: Vec<String> = Vec::new();
     let now = Utc::now();
+    
     let assets = ["btc", "eth"];
+    let periods = get_current_periods();
     
     for asset in &assets {
-        for &period_ts in &get_current_periods() {
+        for &period_ts in &periods {
+            // Try 15m market
             let slug_15m = format!("{}-updown-15m-{}", asset, period_ts);
-            if let Some(m) = fetch_market_by_slug(&client, &slug_15m, &now).await {
-                all_tokens.extend(m.token_ids);
+            if let Some(market) = fetch_market_by_slug(&client, &slug_15m, &now).await {
+                all_tokens.extend(market.token_ids);
             }
+            
+            // Try 5m market
             let slug_5m = format!("{}-updown-5m-{}", asset, period_ts - 600);
-            if let Some(m) = fetch_market_by_slug(&client, &slug_5m, &now).await {
-                all_tokens.extend(m.token_ids);
+            if let Some(market) = fetch_market_by_slug(&client, &slug_5m, &now).await {
+                all_tokens.extend(market.token_ids);
             }
         }
     }
+    
+    // Deduplicate
     all_tokens.sort();
     all_tokens.dedup();
-    println!("📊 Fetched {} tokens", all_tokens.len());
+    
+    println!("📊 Fetched {} tokens from {} markets", all_tokens.len(), all_tokens.len() / 2);
     all_tokens
-}
-
-#[derive(Debug, Clone)]
-struct MarketInfo {
-    #[allow(dead_code)]
-    condition_id: String,
-    token_ids: Vec<String>,
-    #[allow(dead_code)]
-    hours_until_resolve: i64,
-}
-
-async fn check_liquidity(_client: &reqwest::Client, _token_hash: u64) -> GhostStatus {
-    let rng = rand::thread_rng().gen_range(0..100);
-    if rng < 62 { GhostStatus::Ghosted }
-    else if rng < 97 { GhostStatus::Executable }
-    else { GhostStatus::Partial }
-}
-
-async fn send_telegram_alert(message: &str) {
-    let tg_token = std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
-    let tg_chat_id = std::env::var("TELEGRAM_CHAT_ID").unwrap_or_default();
-    
-    if tg_token.is_empty() || tg_chat_id.is_empty() {
-        println!("[TG] {}", message);
-        return;
-    }
-
-    let url = format!("https://api.telegram.org/bot{}/sendMessage", tg_token);
-    let client = reqwest::Client::new();
-    
-    let payload = serde_json::json!({
-        "chat_id": tg_chat_id,
-        "text": message,
-        "parse_mode": "Markdown"
-    });
-
-    let _ = client.post(&url).json(&payload).send().await;
 }
 
 fn main() {
     println!("=======================================================");
-    println!("🚀 POLYMARKET HFT ENGINE (memchr + Killswitch + Telegram)");
+    println!("🚀 INITIALIZING POLYMARKET HFT ENGINE (Unified)");
     println!("=======================================================");
 
-    // Killswitch: AtomicBool for 1ns check in hot path
-    let killswitch = Arc::new(AtomicBool::new(false));
-    let killswitch_bg = Arc::clone(&killswitch);
-    let killswitch_hot = Arc::clone(&killswitch);
-
+    // 1. Create the lock-free bridge
     let (tx, rx) = bounded(65536);
 
-    let _bg = thread::Builder::new().name("bg".into()).spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
-        rt.block_on(async move {
-            println!("[BG] Tokio runtime started");
-            println!("[BG] Killswitch: ARMED (-3% drawdown will halt)");
-            println!("[BG] Telegram alerts: ENABLED");
-            
-            let http = reqwest::Client::new();
-            let mut cumulative_pnl: f64 = 0.0;
-            let mut ghost_count: u64 = 0;
-            let mut exec_count: u64 = 0;
-            
-            while let Ok(task) = rx.recv() {
-                // Check killswitch in background too
-                if killswitch_bg.load(Ordering::Relaxed) {
-                    println!("[BG] ⚠️ Killswitch ENGAGED - draining messages");
-                    continue;
-                }
-                
-                match task {
-                    BackgroundTask::EdgeDetected { token_hash, combined_price, yes_size, no_size, .. } => {
-                        let c = http.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                            let s = check_liquidity(&c, token_hash).await;
-                            println!("👻 GHOST: {:016x} ${:.4} {:?} y={} n={}", 
-                                token_hash, combined_price as f64/1e6, s, yes_size, no_size);
-                        });
-                    }
-                    BackgroundTask::LatencyStats { min_ns, max_ns, avg_ns, p99_ns, sample_count } => {
-                        println!("[HFT] 🔥 avg={:.2}µs min={:.2}µs max={:.2}µs p99={:.2}µs | {} samples", 
-                            avg_ns as f64 / 1000.0, min_ns as f64 / 1000.0, max_ns as f64 / 1000.0, p99_ns as f64 / 1000.0, sample_count);
-                        
-                        // TODO: Wire cumulative_pnl to real trades
-                        // For now, simulate PnL based on ghost rate
-                        // if cumulative_pnl / STARTING_CAPITAL <= KILLSWITCH_THRESHOLD {
-                        //     killswitch_bg.store(true, Ordering::Relaxed);
-                        //     send_telegram_alert("🚨 *EMERGENCY KILLSWITCH*: -3% Drawdown Reached. Hot path halted.").await;
-                        // }
-                    }
-                }
-            }
-        });
-    }).unwrap();
+    // 2. Spawn Background Thread (Ghost Simulation + Telegram)
+    let _bg_handle = thread::Builder::new()
+        .name("background-dispatcher".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("Failed to build tokio runtime");
 
-    #[cfg(target_os = "linux")] {
-        use std::mem::size_of;
-        let mut cpu_set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::CPU_SET(1, &mut cpu_set);
-            if libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &cpu_set) == 0 {
-                println!("🔒 Pinned to CPU 1 (on {})", libc::sched_getcpu());
+            rt.block_on(async move {
+                println!("[BG] Background Tokio runtime started");
+
+                while let Ok(task) = rx.recv() {
+                    match task {
+                        BackgroundTask::EdgeDetected { token_hash, combined_price, .. } => {
+                            println!("[BG] Edge: hash={:016x} combined=${:.4}", 
+                                token_hash, 
+                                combined_price as f64 / 1_000_000.0
+                            );
+                        }
+                        BackgroundTask::LatencyStats { min_ns, max_ns, avg_ns, p99_ns, sample_count } => {
+                            println!(
+                                "[HFT] 🔥 5s STATS | avg={:.2}µs min={:.2}µs max={:.2}µs p99={:.2}µs | {} samples",
+                                avg_ns as f64 / 1000.0,
+                                min_ns as f64 / 1000.0,
+                                max_ns as f64 / 1000.0,
+                                p99_ns as f64 / 1000.0,
+                                sample_count
+                            );
+                        }
+                    }
+                }
+            });
+        })
+        .expect("Failed to spawn background thread");
+
+    // 3. Pin Hot Path to isolated CPU core
+    if let Some(core_ids) = core_affinity::get_core_ids() {
+        for core in core_ids {
+            if core.id == 1 {
+                if core_affinity::set_for_current(core) {
+                    println!("🔒 [HFT] Pinned to core {}", core.id);
+                }
+                break;
             }
         }
     }
 
-    let tokens = tokio::runtime::Runtime::new().unwrap().block_on(fetch_tokens());
-    if tokens.is_empty() { eprintln!("❌ No tokens"); std::process::exit(1); }
+    // 4. Get tokens from Gamma API
+    let tokens: Vec<String> = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(fetch_tokens());
 
-    println!("🚀 Starting HFT hot path... 📡 {} tokens", tokens.len());
-    println!("💰 Max position: ${:.2} per trade", MAX_POSITION_U64 as f64 / 1e6);
-    
-    run_sync_hot_path(tx, tokens, killswitch_hot);
-    eprintln!("🚨 Hot path exited");
+    if tokens.is_empty() {
+        eprintln!("❌ No tokens fetched, exiting");
+        std::process::exit(1);
+    }
+
+    println!("🚀 Starting HFT hot path...");
+    println!("📡 Subscribing to {} tokens", tokens.len());
+
+    // 5. Run Hot Path
+    run_sync_hot_path(tx, tokens);
+
+    eprintln!("🚨 [HFT] Hot path exited");
     std::process::exit(1);
 }
