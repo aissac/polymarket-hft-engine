@@ -7,6 +7,8 @@
 use crossbeam_channel::Sender;
 use std::time::Duration;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Target combined price for arbitrage (94 cents = $0.94)
 ///
@@ -23,6 +25,10 @@ use std::collections::HashMap;
 /// - Ghost Drag: -2.14%
 /// - Net EV: +2.42% per trade
 const EDGE_THRESHOLD_U64: u64 = 940_000;
+
+/// Maximum position size in micro-USDC ($5 = 5_000_000)
+/// Prevents liquidity mirage sweeps and limits exposure
+const MAX_POSITION_U64: u64 = 5_000_000;
 
 /// Background task for crossbeam channel
 #[derive(Debug, Clone)]
@@ -63,7 +69,7 @@ pub enum GhostStatus {
 }
 
 /// Run the synchronous hot path with zero-allocation byte scanning
-pub fn run_sync_hot_path(tx: Sender<BackgroundTask>, tokens: Vec<String>) {
+pub fn run_sync_hot_path(tx: Sender<BackgroundTask>, tokens: Vec<String>, killswitch: Arc<AtomicBool>) {
     use tungstenite::{connect, Message};
     
     // Connect to Polymarket CLOB WebSocket
@@ -109,6 +115,13 @@ pub fn run_sync_hot_path(tx: Sender<BackgroundTask>, tokens: Vec<String>) {
 
     // Main busy-poll loop
     loop {
+        // Killswitch check (1ns atomic read)
+        if killswitch.load(Ordering::Relaxed) {
+            println!("[HFT] 🚨 KILLSWITCH ENGAGED - draining socket");
+            let _ = socket.read(); // Drain but don't process
+            continue;
+        }
+        
         let msg = match socket.read() {
             Ok(m) => m,
             Err(e) => {
@@ -168,19 +181,23 @@ pub fn run_sync_hot_path(tx: Sender<BackgroundTask>, tokens: Vec<String>) {
                         }
                     }
 
-                    // Edge detection
+                    // Edge detection with $5 max position cap
                     let complement_hash = token_hash ^ 1;
-                    if let Some((yes_price, no_price, yes_size, no_size)) = orderbook.get(&token_hash) {
-                        if let Some((c_yes_price, c_no_price, c_yes_size, c_no_size)) = orderbook.get(&complement_hash) {
+                    if let Some((yes_price, _no_price, yes_size, _no_size)) = orderbook.get(&token_hash) {
+                        if let Some((c_yes_price, _c_no_price, c_yes_size, _c_no_size)) = orderbook.get(&complement_hash) {
                             let combined = yes_price + c_yes_price;
                             
                             if combined <= EDGE_THRESHOLD_U64 && *yes_size > 0 && *c_yes_size > 0 {
+                                // Apply $5 max position cap to prevent liquidity sweeps
+                                let capped_yes_size = std::cmp::min(*yes_size, MAX_POSITION_U64);
+                                let capped_no_size = std::cmp::min(*c_yes_size, MAX_POSITION_U64);
+                                
                                 let _ = tx.try_send(BackgroundTask::EdgeDetected {
                                     token_hash,
                                     combined_price: combined,
                                     timestamp_nanos: start_tsc.elapsed().as_nanos() as u64,
-                                    yes_size: *yes_size,
-                                    no_size: *no_size,
+                                    yes_size: capped_yes_size,
+                                    no_size: capped_no_size,
                                 });
                             }
                         }

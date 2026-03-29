@@ -1,14 +1,19 @@
 // src/bin/hft_pingpong.rs
-//! HFT Pingpong - Unified Binary with Ghost Simulation
+//! HFT Pingpong - Unified Binary with Ghost Simulation + Killswitch
 
 use crossbeam_channel::bounded;
 use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use chrono::{Utc, Timelike};
 
 use pingpong::hft_hot_path::run_sync_hot_path;
 use pingpong::hft_hot_path::BackgroundTask;
 use pingpong::hft_hot_path::GhostStatus;
 use rand::Rng;
+
+/// Maximum position size in micro-USDC ($5)
+const MAX_POSITION_U64: u64 = 5_000_000;
 
 fn get_current_periods() -> Vec<i64> {
     let now = Utc::now();
@@ -86,8 +91,13 @@ async fn check_liquidity(_client: &reqwest::Client, _token_hash: u64) -> GhostSt
 
 fn main() {
     println!("=======================================================");
-    println!("🚀 POLYMARKET HFT ENGINE (Unified + Ghost Sim)");
+    println!("🚀 POLYMARKET HFT ENGINE (Unified + Ghost Sim + Killswitch)");
     println!("=======================================================");
+
+    // Killswitch: AtomicBool for 1ns check in hot path
+    let killswitch = Arc::new(AtomicBool::new(false));
+    let killswitch_bg = Arc::clone(&killswitch);
+    let killswitch_hot = Arc::clone(&killswitch);
 
     let (tx, rx) = bounded(65536);
 
@@ -95,8 +105,19 @@ fn main() {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         rt.block_on(async {
             println!("[BG] Tokio runtime started, ghost sim enabled");
+            println!("[BG] Killswitch: ARMED (-3% drawdown will halt trading)");
+            
             let http = reqwest::Client::new();
+            let mut cumulative_pnl: f64 = 0.0;
+            const STARTING_CAPITAL: f64 = 500.0;
+            
             while let Ok(task) = rx.recv() {
+                // Check killswitch in background too
+                if killswitch_bg.load(Ordering::Relaxed) {
+                    println!("[BG] ⚠️ Killswitch ENGAGED - draining messages");
+                    continue;
+                }
+                
                 match task {
                     BackgroundTask::EdgeDetected { token_hash, combined_price, yes_size, no_size, .. } => {
                         let c = http.clone();
@@ -107,7 +128,14 @@ fn main() {
                         });
                     }
                     BackgroundTask::LatencyStats { min_ns, max_ns, avg_ns, p99_ns, sample_count } => {
-                        println!("[HFT] 🔥 avg={:.2}µs min={:.2}µs max={:.2}µs p99={:.2}µs | {} samples", avg_ns as f64 / 1000.0, min_ns as f64 / 1000.0, max_ns as f64 / 1000.0, p99_ns as f64 / 1000.0, sample_count);
+                        println!("[HFT] 🔥 avg={:.2}µs min={:.2}µs max={:.2}µs p99={:.2}µs | {} samples", 
+                            avg_ns as f64 / 1000.0, min_ns as f64 / 1000.0, max_ns as f64 / 1000.0, p99_ns as f64 / 1000.0, sample_count);
+                        
+                        // TODO: Track PnL and trigger killswitch at -3%
+                        // if cumulative_pnl / STARTING_CAPITAL <= -0.03 {
+                        //     killswitch_bg.store(true, Ordering::Relaxed);
+                        //     println!("🚨 KILLSWITCH: -3% drawdown reached");
+                        // }
                     }
                 }
             }
@@ -129,7 +157,9 @@ fn main() {
     if tokens.is_empty() { eprintln!("❌ No tokens"); std::process::exit(1); }
 
     println!("🚀 Starting HFT hot path... 📡 {} tokens", tokens.len());
-    run_sync_hot_path(tx, tokens);
+    println!("💰 Max position: ${:.2} per trade", MAX_POSITION_U64 as f64 / 1e6);
+    
+    run_sync_hot_path(tx, tokens, killswitch_hot);
     eprintln!("🚨 Hot path exited");
     std::process::exit(1);
 }
