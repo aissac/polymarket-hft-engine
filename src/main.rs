@@ -20,6 +20,7 @@ mod pnl;
 mod gabagool_strategy;
 mod merger;
 mod maker_hybrid;
+mod ghost_simulator;
 mod simd_hot_path;
 
 use api::{PolyClient, SimplifiedMarket};
@@ -463,22 +464,56 @@ async fn run_websocket_mode(
                             );
                         }
                         
-                        // Calculate profit for minimum trade check
-                        // Scale minimum based on shares: require at least $0.10 per share
-                        let min_profit = shares_f * 0.10;
+                        // Calculate net profit for tracking
                         let gross_profit = shares_f - combined * shares_f - (combined * shares_f * 0.02);
                         let net_profit = gross_profit - 0.003;
-                        
-                        // Only execute if net profit >= minimum threshold
-                        if net_profit < min_profit {
-                            // Below minimum trade value - skip
-                            info!("BLOCKED: net_profit ${:.4} < min_profit ${:.4} for {} | Edge: {:.1}% | Size: {:.0}", net_profit, min_profit, &condition_id[..8.min(condition_id.len())], edge * 100.0, shares_f);
-                            continue;
-                        }
                         
                         // Send to trading engine for real execution
                         pnl_tracker.record_arb_opportunity();
                         pnl_tracker.record_fill_attempt();
+                        
+                        // GHOST SIMULATION: Track if liquidity vanishes after 50ms RTT
+                        // Mark current depth as baseline
+                        state.tracker.mark_queue_start(&condition_id);
+                        
+                        // Store opportunity details for ghost check
+                        let ghost_condition = condition_id.clone();
+                        let ghost_yes_depth = yes_depth;
+                        let ghost_no_depth = no_depth;
+                        let ghost_side = if is_extreme_prob { maker_side.to_string() } else { "BOTH".to_string() };
+                        let ghost_price = combined;
+                        
+                        // Spawn async task to check after 50ms RTT
+                        let tracker_clone = Arc::clone(&state.tracker);
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            
+                            // Check if depth still exists
+                            if let Some(prices) = tracker_clone.get(&ghost_condition) {
+                                let yes_ok = prices.yes_depth >= ghost_yes_depth * 0.5;
+                                let no_ok = prices.no_depth >= ghost_no_depth * 0.5;
+                                
+                                if !yes_ok && !no_ok {
+                                    tracing::info!(
+                                        "GHOST SIMULATION: {} | {} @ ${:.4} | Depth vanished: YES {:.0}->{:.0}, NO {:.0}->{:.0}",
+                                        &ghost_condition[..8.min(ghost_condition.len())],
+                                        ghost_side,
+                                        ghost_price,
+                                        ghost_yes_depth, prices.yes_depth,
+                                        ghost_no_depth, prices.no_depth
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        "EXECUTABLE SIMULATION: {} | {} @ ${:.4} | Depth OK: YES {:.0}->{:.0}, NO {:.0}->{:.0}",
+                                        &ghost_condition[..8.min(ghost_condition.len())],
+                                        ghost_side,
+                                        ghost_price,
+                                        ghost_yes_depth, prices.yes_depth,
+                                        ghost_no_depth, prices.no_depth
+                                    );
+                                }
+                            }
+                        });
                         
                         // Check 5-min rolling capital cap
                         let now = std::time::Instant::now();

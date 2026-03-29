@@ -4,6 +4,7 @@
 //! Executes arbitrage trades via polymarket-client-sdk.
 
 mod orderbook;
+mod ghost_simulator;
 mod api;
 mod strategy;
 mod trading;
