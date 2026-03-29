@@ -10,6 +10,7 @@ mod strategy;
 mod trading;
 mod maker_hybrid;
 mod simd_hot_path;
+pub mod hft_hot_path;
 mod hot_path_optimized;
 mod websocket;
 // mod polyfill_integration; // Disabled - polyfill-rs bug

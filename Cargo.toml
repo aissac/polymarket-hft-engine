@@ -11,6 +11,8 @@ tokio = { version = "1.35", features = ["full"] }
 
 # WebSocket client
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+url = "2.5"
+tungstenite = "0.24"
 futures-util = { version = "0.3", default-features = false, features = ["std", "tokio-io"] }
 
 # HTTP client
@@ -53,3 +55,11 @@ crossbeam-channel = "0.5"
 minstant = "0.1"
 core_affinity = "0.8"
 
+
+[[bin]]
+name = "hft_pingpong"
+path = "src/bin/hft_pingpong.rs"
+
+[[bin]]
+name = "pingpong"
+path = "src/main.rs"
