@@ -1,6 +1,7 @@
 //! CLOB Order Execution for Polymarket
 //! 
-//! Handles order submission, L2 authentication, and 429 backoff.
+//! Handles order submission, L2 authentication, and dynamic fee rate fetching.
+//! Uses direct HTTP POST for order submission (DRY RUN mode ready).
 
 use reqwest::{Client, StatusCode, header::{HeaderMap, HeaderValue, CONTENT_TYPE}};
 use serde_json::{json, Value};
@@ -10,10 +11,11 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::signing::{sign_polymarket_order};
+// Re-export from signing
+pub use crate::signing::{Order, Side, OrderType, SignatureType, PrivateKeySigner};
 
-use alloy_signer_local::PrivateKeySigner;
-use alloy_primitives::Address;
+use alloy_primitives::{Address, U256};
+use std::str::FromStr;
 
 const CLOB_BASE: &str = "https://clob.polymarket.com";
 
@@ -57,47 +59,6 @@ pub fn build_l2_headers(
     headers
 }
 
-/// Submit order with exponential backoff for 429 errors
-pub async fn submit_order_with_backoff(
-    client: &Client,
-    payload: Value,
-    headers: HeaderMap,
-) -> Result<Value, String> {
-    let mut retries = 0;
-    let max_retries = 3;
-    let url = format!("{}/order", CLOB_BASE);
-
-    loop {
-        let resp = client
-            .post(&url)
-            .headers(headers.clone())
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-
-        match resp.status() {
-            StatusCode::OK => {
-                let body = resp.text().await.unwrap_or_default();
-                if body.contains("error") || body.contains("success\":false") {
-                    return Err(format!("CLOB Error: {}", body));
-                }
-                return serde_json::from_str(&body).map_err(|e| e.to_string());
-            }
-            StatusCode::TOO_MANY_REQUESTS => {
-                if retries >= max_retries {
-                    return Err("Max retries exceeded on 429".to_string());
-                }
-                let backoff_ms = 2u64.pow(retries) * 100; // 100ms, 200ms, 400ms
-                println!("⚠️ 429 Rate Limit Hit. Backing off for {}ms", backoff_ms);
-                sleep(Duration::from_millis(backoff_ms)).await;
-                retries += 1;
-            }
-            other => return Err(format!("API HTTP Error: {}", other)),
-        }
-    }
-}
-
 /// Fetch dynamic fee rate for a token
 pub async fn fetch_fee_rate(client: &Client, token_id: &str) -> Result<u64, String> {
     let url = format!("{}/fee-rate?token_id={}", CLOB_BASE, token_id);
@@ -106,7 +67,7 @@ pub async fn fetch_fee_rate(client: &Client, token_id: &str) -> Result<u64, Stri
         .get(&url)
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("Fee rate fetch error: {}", e))?;
 
     if !resp.status().is_success() {
         return Err(format!("Failed to fetch fee rate: {}", resp.status()));
@@ -114,143 +75,121 @@ pub async fn fetch_fee_rate(client: &Client, token_id: &str) -> Result<u64, Stri
 
     let body = resp.text().await.map_err(|e| e.to_string())?;
     let json: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-    
-    // Fee rate is returned in basis points
+
+    // feeRateBps is the fee in basis points
     json.get("feeRateBps")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| "No feeRateBps in response".to_string())
 }
 
-/// Create and sign a Polymarket order
-pub async fn create_signed_order(
-    signer: &PrivateKeySigner,
+/// Create order payload for Polymarket CLOB
+/// This creates the JSON payload directly (no SDK dependency)
+pub fn create_order_payload(
     maker: Address,
+    signer: Address,
+    taker: Address,
     token_id: &str,
     maker_amount: u64,
     taker_amount: u64,
     fee_rate_bps: u64,
-    side: u8, // 0 = BUY, 1 = SELL
-) -> Result<Value, String> {
-    // Create order struct
-    let order = create_order(
-        maker,
-        signer.address(),
-        Address::ZERO, // taker = 0 for resting orders
-        token_id,
-        maker_amount,
-        taker_amount,
-        fee_rate_bps,
-        side,
-    );
-
-    // Sign the order
-    let signature = sign_polymarket_order(&order, signer)?;
-
-    // Convert to JSON payload
-    Ok(json!({
-        "salt": order.salt.to_string(),
-        "maker": format!("{:?}", order.maker),
-        "signer": format!("{:?}", order.signer),
-        "taker": format!("{:?}", order.taker),
+    side: u8,
+    salt: u64,
+    expiration: u64,
+    nonce: u64,
+) -> Value {
+    json!({
+        "salt": salt,
+        "maker": format!("{:?}", maker),
+        "signer": format!("{:?}", signer),
+        "taker": format!("{:?}", taker),
         "tokenId": token_id,
-        "makerAmount": order.makerAmount.to_string(),
-        "takerAmount": order.takerAmount.to_string(),
-        "expiration": "0",
-        "nonce": "0",
-        "feeRateBps": order.feeRateBps.to_string(),
-        "side": order.side,
-        "signatureType": 2,
-        "signature": signature
-    }))
+        "makerAmount": maker_amount.to_string(),
+        "takerAmount": taker_amount.to_string(),
+        "expiration": expiration.to_string(),
+        "nonce": nonce.to_string(),
+        "feeRateBps": fee_rate_bps.to_string(),
+        "side": side,
+        "signatureType": 2,  // GNOSIS_SAFE for gasless
+    })
 }
 
-/// Execute Maker order (resting limit order)
-pub async fn execute_maker_order(
+/// Submit order with exponential backoff for 429 errors
+/// In DRY_RUN mode, returns Ok(()) without actually sending
+pub async fn submit_order(
     client: &Client,
-    signer: &PrivateKeySigner,
-    maker: Address,
-    token_id: &str,
-    price: f64,      // In USDC (e.g., 0.40)
-    size: u64,        // In micro-USDC (e.g., 5000000 = $5)
+    order_payload: &Value,
+    signature: &str,
     api_key: &str,
     api_secret: &str,
     api_passphrase: &str,
+    signer_address: &str,
+    dry_run: bool,
+    max_retries: u32,
 ) -> Result<Value, String> {
-    // Fetch dynamic fee rate
-    let fee_rate = fetch_fee_rate(client, token_id).await?;
+    // DRY RUN mode: validate payload but don't submit
+    if dry_run {
+        println!("[DRY_RUN] Would submit order:");
+        println!("  Payload: {}", serde_json::to_string_pretty(order_payload).unwrap());
+        println!("  Signature: {}", signature);
+        return Ok(json!({"order_id": "dry_run_mock", "status": "dry_run"}));
+    }
     
-    // Convert price to maker amount (USDC) and taker amount (shares)
-    let maker_amount = (price * 1_000_000.0) as u64 * size / 1_000_000;
-    let taker_amount = size;
+    let mut retry_delay_ms = 100;
+    
+    for attempt in 0..=max_retries {
+        let body_str = serde_json::to_string(order_payload).unwrap();
+        let headers = build_l2_headers(
+            api_key,
+            api_secret,
+            api_passphrase,
+            signer_address,
+            "POST",
+            "/order",
+            &body_str,
+        );
 
-    // Create signed order
-    let payload = create_signed_order(
-        signer,
-        maker,
-        token_id,
-        maker_amount,
-        taker_amount,
-        fee_rate,
-        0, // BUY
-    ).await?;
+        // Add signature to payload
+        let mut full_payload = order_payload.clone();
+        full_payload["signature"] = Value::String(signature.to_string());
 
-    // Build headers
-    let body_str = serde_json::to_string(&payload).unwrap();
-    let headers = build_l2_headers(
-        api_key,
-        api_secret,
-        api_passphrase,
-        &format!("{:?}", signer.address()),
-        "POST",
-        "/order",
-        &body_str,
-    );
+        let resp = client
+            .post(&format!("{}/order", CLOB_BASE))
+            .headers(headers)
+            .json(&full_payload)
+            .send()
+            .await
+            .map_err(|e| format!("Request error: {}", e))?;
 
-    // Submit order
-    submit_order_with_backoff(client, payload, headers).await
+        match resp.status() {
+            StatusCode::OK | StatusCode::CREATED => {
+                let body = resp.text().await.map_err(|e| e.to_string())?;
+                let json: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+                return Ok(json);
+            }
+            StatusCode::TOO_MANY_REQUESTS => {
+                if attempt == max_retries {
+                    return Err("Max retries exceeded for rate limit".to_string());
+                }
+                sleep(Duration::from_millis(retry_delay_ms)).await;
+                retry_delay_ms *= 2;
+            }
+            status => {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(format!("Order rejected: {} - {}", status, body));
+            }
+        }
+    }
+    
+    Err("Unexpected error".to_string())
 }
 
-/// Execute Taker order (immediate fill - FAK)
-pub async fn execute_taker_order(
-    client: &Client,
-    signer: &PrivateKeySigner,
-    maker: Address,
-    token_id: &str,
-    price: f64,
-    size: u64,
-    api_key: &str,
-    api_secret: &str,
-    api_passphrase: &str,
-) -> Result<Value, String> {
-    // Fetch dynamic fee rate
-    let fee_rate = fetch_fee_rate(client, token_id).await?;
-    
-    // For taker, we cross the spread at aggressive price
-    let maker_amount = (price * 1_000_000.0) as u64 * size / 1_000_000;
-    let taker_amount = size;
-
-    let payload = create_signed_order(
-        signer,
-        maker,
-        token_id,
-        maker_amount,
-        taker_amount,
-        fee_rate,
-        0, // BUY
-    ).await?;
-
-    let body_str = serde_json::to_string(&payload).unwrap();
-    let headers = build_l2_headers(
-        api_key,
-        api_secret,
-        api_passphrase,
-        &format!("{:?}", signer.address()),
-        "POST",
-        "/order",
-        &body_str,
-    );
-
-    submit_order_with_backoff(client, payload, headers).await
+/// Generate a random salt for orders
+pub fn generate_salt() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
 }
 
 #[cfg(test)]
@@ -258,17 +197,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_header_construction() {
+    fn test_build_l2_headers() {
         let headers = build_l2_headers(
             "test_key",
-            "dGVzdF9zZWNyZXQ=", // base64 "test_secret"
+            "dGVzdF9zZWNyZXQ=", // base64 of "test_secret"
             "test_pass",
             "0x1234",
             "POST",
             "/order",
             "{}",
         );
+        
         assert!(headers.contains_key("POLY_ADDRESS"));
         assert!(headers.contains_key("POLY_API_KEY"));
+        assert!(headers.contains_key("POLY_TIMESTAMP"));
+        assert!(headers.contains_key("POLY_SIGNATURE"));
+    }
+
+    #[test]
+    fn test_create_order_payload() {
+        let maker = Address::from_str("0x1234567890123456789012345678901234567890").unwrap();
+        let signer = maker;
+        let taker = Address::ZERO;
+        
+        let payload = create_order_payload(
+            maker, signer, taker,
+            "1234567890",
+            1000000, // $1.00 in USDC (6 decimals)
+            1000000,
+            180, // 1.80% fee
+            0,   // BUY
+            12345,
+            0,   // never expires
+            0,
+        );
+        
+        assert_eq!(payload["side"], 0);
+        assert_eq!(payload["signatureType"], 2);
+        assert_eq!(payload["feeRateBps"], "180");
     }
 }

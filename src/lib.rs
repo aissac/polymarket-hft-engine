@@ -17,7 +17,7 @@ mod websocket;
 pub mod production;
 // Live trading modules
 pub mod signing;
-// pub mod execution;
+pub mod execution;
 // pub mod merge_worker;
 // pub mod stop_loss;
 // pub mod state;
@@ -32,7 +32,7 @@ pub use production::{ProductionGuard, CircuitBreaker, LiquidityCheck, GasEstimat
 // Live trading exports
 pub use signing::{init_signer};
 
-// pub use execution::{submit_order_with_backoff, build_l2_headers, fetch_fee_rate};
+pub use execution::{submit_order, build_l2_headers, fetch_fee_rate, create_order_payload, generate_salt};
 // pub use merge_worker::{run_merge_worker, MergeTask};
 // pub use stop_loss::{start_stop_loss_timer, execute_fak_order, ExecutionState, handle_trade_event};
 // pub use state::ExecutionState as HedgeState;
