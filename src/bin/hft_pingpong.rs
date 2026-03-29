@@ -3,6 +3,8 @@
 
 use crossbeam_channel::bounded;
 use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use chrono::{Utc, Timelike};
 
 use pingpong::hft_hot_path::run_sync_hot_path;
@@ -99,8 +101,12 @@ async fn fetch_tokens() -> Vec<String> {
 
 fn main() {
     println!("=======================================================");
-    println!("🚀 INITIALIZING POLYMARKET HFT ENGINE (Unified)");
+    println!("🚀 POLYMARKET HFT ENGINE (memchr + Killswitch + Telegram)");
     println!("=======================================================");
+
+    // Killswitch: AtomicBool for 1ns check in hot path
+    let killswitch = Arc::new(AtomicBool::new(false));
+    let killswitch_hot = Arc::clone(&killswitch);
 
     // 1. Create the lock-free bridge
     let (tx, rx) = bounded(65536);
@@ -116,19 +122,23 @@ fn main() {
                 .expect("Failed to build tokio runtime");
 
             rt.block_on(async move {
-                println!("[BG] Background Tokio runtime started");
+                println!("[BG] Tokio runtime started");
+                println!("[BG] Killswitch: ARMED (-3% drawdown will halt)");
 
                 while let Ok(task) = rx.recv() {
                     match task {
-                        BackgroundTask::EdgeDetected { token_hash, combined_price, .. } => {
-                            println!("[BG] Edge: hash={:016x} combined=${:.4}", 
+                        BackgroundTask::EdgeDetected { token_hash, combined_price, yes_size, no_size, .. } => {
+                            // Ghost simulation would go here
+                            println!("📊 Edge: hash={:016x} combined=${:.4} yes={} no={}", 
                                 token_hash, 
-                                combined_price as f64 / 1_000_000.0
+                                combined_price as f64 / 1_000_000.0,
+                                yes_size,
+                                no_size
                             );
                         }
                         BackgroundTask::LatencyStats { min_ns, max_ns, avg_ns, p99_ns, sample_count } => {
                             println!(
-                                "[HFT] 🔥 5s STATS | avg={:.2}µs min={:.2}µs max={:.2}µs p99={:.2}µs | {} samples",
+                                "[HFT] 🔥 avg={:.2}µs min={:.2}µs max={:.2}µs p99={:.2}µs | {} samples",
                                 avg_ns as f64 / 1000.0,
                                 min_ns as f64 / 1000.0,
                                 max_ns as f64 / 1000.0,
@@ -143,13 +153,14 @@ fn main() {
         .expect("Failed to spawn background thread");
 
     // 3. Pin Hot Path to isolated CPU core
-    if let Some(core_ids) = core_affinity::get_core_ids() {
-        for core in core_ids {
-            if core.id == 1 {
-                if core_affinity::set_for_current(core) {
-                    println!("🔒 [HFT] Pinned to core {}", core.id);
-                }
-                break;
+    #[cfg(target_os = "linux")]
+    {
+        use std::mem::size_of;
+        let mut cpu_set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::CPU_SET(1, &mut cpu_set);
+            if libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &cpu_set) == 0 {
+                println!("🔒 Pinned to CPU 1 (on {})", libc::sched_getcpu());
             }
         }
     }
@@ -164,12 +175,12 @@ fn main() {
         std::process::exit(1);
     }
 
-    println!("🚀 Starting HFT hot path...");
-    println!("📡 Subscribing to {} tokens", tokens.len());
+    println!("🚀 Starting HFT hot path... 📡 {} tokens", tokens.len());
+    println!("💰 Max position: $5.00 per trade");
 
-    // 5. Run Hot Path
-    run_sync_hot_path(tx, tokens);
+    // 5. Run Hot Path with Killswitch
+    run_sync_hot_path(tx, tokens, killswitch_hot);
 
-    eprintln!("🚨 [HFT] Hot path exited");
+    eprintln!("🚨 Hot path exited");
     std::process::exit(1);
 }
