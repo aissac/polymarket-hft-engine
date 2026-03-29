@@ -1,6 +1,9 @@
 // src/hft_hot_path.rs
 //! HFT Hot Path - Zero-Allocation Raw Byte Scanner with memchr
-//! CRITICAL FIX: Build token pairs dynamically from WebSocket data
+//! 
+//! FIX: Variable-length token IDs (not fixed 66 chars)
+//! FIX: Use token_pairs from Gamma API (correct YES/NO mapping)
+//! FIX: Threshold restored to $0.94
 
 use crossbeam_channel::Sender;
 use std::time::Duration;
@@ -8,7 +11,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-const EDGE_THRESHOLD_U64: u64 = 1_000_000;  // $1.00 to see edges
+const EDGE_THRESHOLD_U64: u64 = 940_000; // Upper bound
+const MIN_VALID_COMBINED_U64: u64 = 900_000; // Lower bound (reject stale transient states)
 const MAX_POSITION_U64: u64 = 5_000_000;
 
 #[derive(Debug, Clone)]
@@ -31,14 +35,14 @@ pub enum BackgroundTask {
 
 pub fn run_sync_hot_path(
     tx: Sender<BackgroundTask>,
-    _tokens: Vec<String>,
+    tokens: Vec<String>,
     killswitch: Arc<AtomicBool>,
-    _token_pairs: HashMap<u64, u64>,  // Keep parameter but ignore - build dynamically
+    token_pairs: HashMap<u64, u64>,
 ) {
     use tungstenite::{connect, Message};
     
     println!("[HFT] Using memchr zero-allocation scanner (target: <1µs)");
-    println!("[HFT] Building token pairs dynamically from WebSocket data...");
+    println!("[HFT] Token pairs from Gamma API: {} pairs", token_pairs.len() / 2);
     
     let ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
     
@@ -57,25 +61,24 @@ pub fn run_sync_hot_path(
         "type": "market",
         "operation": "subscribe",
         "markets": [],
-        "assets_ids": _tokens,
+        "assets_ids": tokens,
         "initial_dump": true
     });
     
     let msg_str = serde_json::to_string(&subscribe_msg).expect("Failed to serialize subscription");
     let _ = socket.write_message(Message::Text(msg_str.into()));
     
-    println!("📡 Subscribed to {} tokens", _tokens.len());
+    println!("📡 Subscribed to {} tokens", tokens.len());
     println!("[HFT] 🔥 Starting MEMCHR hot path (50-100ns target)...");
 
     let mut orderbook: HashMap<u64, (u64, u64, u64, u64)> = HashMap::with_capacity(128);
-    let mut token_pairs: HashMap<u64, u64> = HashMap::new();  // Build dynamically
     let mut warmup_count = 0;
     let mut latency_samples: Vec<u64> = Vec::with_capacity(8192);
     let mut last_stat_time = std::time::Instant::now();
-    let mut tokens_in_message: Vec<u64> = Vec::with_capacity(24);
     
     static MSG_COUNTER: AtomicU64 = AtomicU64::new(0);
     static DEBUG_PRINTED: AtomicBool = AtomicBool::new(false);
+    static EDGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     loop {
         if killswitch.load(Ordering::Relaxed) {
@@ -104,8 +107,8 @@ pub fn run_sync_hot_path(
                     &mut last_stat_time,
                     &MSG_COUNTER,
                     &DEBUG_PRINTED,
-                    &mut token_pairs,
-                    &mut tokens_in_message,
+                    &EDGE_COUNTER,
+                    &token_pairs,
                 );
             }
             Message::Binary(data) => {
@@ -120,8 +123,8 @@ pub fn run_sync_hot_path(
                         &mut last_stat_time,
                         &MSG_COUNTER,
                         &DEBUG_PRINTED,
-                        &mut token_pairs,
-                        &mut tokens_in_message,
+                        &EDGE_COUNTER,
+                        &token_pairs,
                     );
                 }
             }
@@ -143,8 +146,8 @@ fn process_message(
     last_stat_time: &mut std::time::Instant,
     msg_counter: &AtomicU64,
     debug_printed: &AtomicBool,
-    token_pairs: &mut HashMap<u64, u64>,  // Mutable - build dynamically
-    tokens_in_message: &mut Vec<u64>,
+    edge_counter: &AtomicU64,
+    token_pairs: &HashMap<u64, u64>,
 ) {
     use memchr::{memchr, memmem};
     
@@ -176,16 +179,15 @@ fn process_message(
     
     let mut search_start = 0;
     let mut tokens_parsed = 0;
-    tokens_in_message.clear();
     
-    // Parse ALL tokens in this message
+    // Parse ALL tokens in this message with VARIABLE-LENGTH token IDs
     while let Some(asset_idx) = asset_pattern.find(&bytes[search_start..]) {
         let token_start = search_start + asset_idx + 12;
         
-        if token_start + 66 <= len {
-            let token_bytes = &bytes[token_start..token_start + 66];
+        // CRITICAL FIX: Find closing quote for variable-length token ID
+        if let Some(token_end) = memchr(b'"', &bytes[token_start..]) {
+            let token_bytes = &bytes[token_start..token_start + token_end];
             let token_hash = fast_hash(token_bytes);
-            tokens_in_message.push(token_hash);
             
             let price_search_start = token_start;
             if let Some(price_idx) = price_pattern.find(&bytes[price_search_start..]) {
@@ -212,6 +214,34 @@ fn process_message(
                                                 .or_insert((price, 0, size, 0));
                                             
                                             tokens_parsed += 1;
+                                            
+                                            // Use pre-computed token_pairs from Gamma API
+                                            if let Some(&complement_hash) = token_pairs.get(&token_hash) {
+                                                if let Some((c_yes_price, _, c_yes_size, _)) = orderbook.get(&complement_hash) {
+                                                    if let Some((yes_price, _, yes_size, _)) = orderbook.get(&token_hash) {
+                                                        let combined = yes_price + c_yes_price;
+                                                        
+                                                        if combined <= EDGE_THRESHOLD_U64 && combined >= MIN_VALID_COMBINED_U64 && *yes_size > 0 && *c_yes_size > 0 {
+                                                            let ec = edge_counter.fetch_add(1, Ordering::Relaxed);
+                                                            if ec < 10 || ec % 100 == 0 {
+                                                                println!("[EDGE] 🎯 FOUND! combined=${:.4} threshold=$0.94", 
+                                                                    combined as f64 / 1_000_000.0);
+                                                            }
+                                                            
+                                                            let capped_yes = std::cmp::min(*yes_size, MAX_POSITION_U64);
+                                                            let capped_no = std::cmp::min(*c_yes_size, MAX_POSITION_U64);
+                                                            
+                                                            let _ = tx.try_send(BackgroundTask::EdgeDetected {
+                                                                token_hash,
+                                                                combined_price: combined,
+                                                                timestamp_nanos: start_tsc.elapsed().as_nanos() as u64,
+                                                                yes_size: capped_yes,
+                                                                no_size: capped_no,
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -220,55 +250,11 @@ fn process_message(
                     }
                 }
             }
-        }
-        
-        search_start = token_start + 66;
-    }
-    
-    // Build token pairs dynamically: tokens appearing together in a message are paired
-    if tokens_in_message.len() >= 2 {
-        // For each pair of tokens in the message, assume they're YES/NO of same market
-        for i in 0..tokens_in_message.len() {
-            for j in (i+1)..tokens_in_message.len() {
-                let hash1 = tokens_in_message[i];
-                let hash2 = tokens_in_message[j];
-                token_pairs.insert(hash1, hash2);
-                token_pairs.insert(hash2, hash1);
-            }
-        }
-    }
-    
-    // Edge detection for each token
-    for &token_hash in tokens_in_message.iter() {
-        if let Some(&complement_hash) = token_pairs.get(&token_hash) {
-            if let Some((c_yes_price, _, c_yes_size, _)) = orderbook.get(&complement_hash) {
-                if let Some((yes_price, _, yes_size, _)) = orderbook.get(&token_hash) {
-                    let combined = yes_price + c_yes_price;
-                    
-                    static COMBINED_COUNTER: AtomicU64 = AtomicU64::new(0);
-                    let cc = COMBINED_COUNTER.fetch_add(1, Ordering::Relaxed);
-                    if cc % 100 == 0 {
-                        println!("[DEBUG] Combined: ${:.4} (threshold: $1.00) | token_hash={:016x}", 
-                            combined as f64 / 1_000_000.0, token_hash);
-                    }
-                    
-                    if combined <= EDGE_THRESHOLD_U64 && *yes_size > 0 && *c_yes_size > 0 {
-                        println!("[EDGE] 🔥 FOUND! combined=${:.4} yes_size={} no_size={}", 
-                            combined as f64 / 1_000_000.0, yes_size, c_yes_size);
-                        
-                        let capped_yes = std::cmp::min(*yes_size, MAX_POSITION_U64);
-                        let capped_no = std::cmp::min(*c_yes_size, MAX_POSITION_U64);
-                        
-                        let _ = tx.try_send(BackgroundTask::EdgeDetected {
-                            token_hash,
-                            combined_price: combined,
-                            timestamp_nanos: start_tsc.elapsed().as_nanos() as u64,
-                            yes_size: capped_yes,
-                            no_size: capped_no,
-                        });
-                    }
-                }
-            }
+            
+            // Move past this token (including closing quote)
+            search_start = token_start + token_end + 1;
+        } else {
+            break;  // Malformed JSON
         }
     }
     
@@ -276,8 +262,7 @@ fn process_message(
         static PARSE_COUNTER: AtomicU64 = AtomicU64::new(0);
         let pc = PARSE_COUNTER.fetch_add(1, Ordering::Relaxed);
         if pc % 50 == 0 {
-            println!("[DEBUG] Parsed {} tokens, pairs map: {} entries (orderbook size: {})", 
-                tokens_parsed, token_pairs.len(), orderbook.len());
+            println!("[DEBUG] Parsed {} tokens (orderbook size: {})", tokens_parsed, orderbook.len());
         }
     }
 
@@ -304,24 +289,26 @@ fn process_message(
         // DIAGNOSTIC
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         println!("📊 ORDERBOOK DIAGNOSTIC ({} entries)", orderbook.len());
-        println!("🔑 Token pairs map: {} entries", token_pairs.len());
+        println!("🔑 Token pairs (Gamma API): {} pairs", token_pairs.len() / 2);
         
         let mut populated_pairs = 0;
-        for (hash1, hash2) in token_pairs.iter() {
-            if let (Some((p1, _, s1, _)), Some((p2, _, s2, _))) = (orderbook.get(hash1), orderbook.get(hash2)) {
-                if *s1 > 0 && *s2 > 0 {
-                    let combined = p1 + p2;
+        for (yes_hash, no_hash) in token_pairs.iter() {
+            if let (Some((y_price, _, y_size, _)), Some((n_price, _, n_size, _))) = 
+                (orderbook.get(yes_hash), orderbook.get(no_hash)) 
+            {
+                if *y_size > 0 && *n_size > 0 {
+                    let combined = y_price + n_price;
                     populated_pairs += 1;
                     if populated_pairs <= 3 {
-                        println!("✅ PAIR | Combined: ${:.4} | H1: ${:.2}(sz:{}) | H2: ${:.2}(sz:{})", 
+                        println!("✅ PAIR | Combined: ${:.4} | Y: ${:.2}(sz:{}) | N: ${:.2}(sz:{})", 
                             combined as f64 / 1_000_000.0,
-                            *p1 as f64 / 1_000_000.0, s1,
-                            *p2 as f64 / 1_000_000.0, s2);
+                            *y_price as f64 / 1_000_000.0, y_size,
+                            *n_price as f64 / 1_000_000.0, n_size);
                     }
                 }
             }
         }
-        println!("🎯 Total fully populated pairs: {}", populated_pairs / 2);
+        println!("🎯 Total fully populated pairs: {}/{}", populated_pairs / 2, token_pairs.len() / 4);
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         
         latency_samples.clear();
@@ -351,3 +338,5 @@ fn parse_fixed_6(bytes: &[u8]) -> u64 {
     while digits < 6 { val *= 10; digits += 1; }
     val
 }
+// Debug: Show what token these hashes map to
+static DEBUG_HASH_COUNTER: AtomicU64 = AtomicU64::new(0);
