@@ -22,6 +22,8 @@ pub mod merge_worker;
 pub mod stop_loss;
 pub mod state;
 pub mod condition_map;
+pub mod token_map;
+pub mod background_wiring;
 pub mod maker_taker_routing;
 pub mod user_ws;
 

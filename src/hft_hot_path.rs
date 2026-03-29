@@ -19,6 +19,7 @@ const MAX_POSITION_U64: u64 = 5_000_000;
 pub enum BackgroundTask {
     EdgeDetected {
         token_hash: u64,
+        complement_hash: u64,
         combined_price: u64,
         timestamp_nanos: u64,
         yes_size: u64,
@@ -233,6 +234,7 @@ fn process_message(
                                                             
                                                             let _ = tx.try_send(BackgroundTask::EdgeDetected {
                                                                 token_hash,
+                                                                complement_hash,
                                                                 combined_price: combined,
                                                                 timestamp_nanos: start_tsc.elapsed().as_nanos() as u64,
                                                                 yes_size: capped_yes,
