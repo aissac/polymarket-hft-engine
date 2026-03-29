@@ -31,6 +31,8 @@ pub enum BackgroundTask {
         token_hash: u64,
         combined_price: u64,
         timestamp_nanos: u64,
+        yes_size: u64,
+        no_size: u64,
     },
     LatencyStats {
         min_ns: u64,
@@ -39,6 +41,25 @@ pub enum BackgroundTask {
         p99_ns: u64,
         sample_count: u64,
     },
+}
+
+/// Ghost simulation result
+#[derive(Debug, Clone)]
+pub struct GhostResult {
+    pub token_hash: u64,
+    pub combined_price: u64,
+    pub status: GhostStatus,
+    pub initial_yes_size: u64,
+    pub initial_no_size: u64,
+    pub remaining_yes_size: u64,
+    pub remaining_no_size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GhostStatus {
+    Executable,
+    Partial,
+    Ghosted,
 }
 
 /// Run the synchronous hot path with zero-allocation byte scanning
@@ -149,8 +170,8 @@ pub fn run_sync_hot_path(tx: Sender<BackgroundTask>, tokens: Vec<String>) {
 
                     // Edge detection
                     let complement_hash = token_hash ^ 1;
-                    if let Some((yes_price, _, yes_size, _)) = orderbook.get(&token_hash) {
-                        if let Some((c_yes_price, _, c_yes_size, _)) = orderbook.get(&complement_hash) {
+                    if let Some((yes_price, no_price, yes_size, no_size)) = orderbook.get(&token_hash) {
+                        if let Some((c_yes_price, c_no_price, c_yes_size, c_no_size)) = orderbook.get(&complement_hash) {
                             let combined = yes_price + c_yes_price;
                             
                             if combined <= EDGE_THRESHOLD_U64 && *yes_size > 0 && *c_yes_size > 0 {
@@ -158,6 +179,8 @@ pub fn run_sync_hot_path(tx: Sender<BackgroundTask>, tokens: Vec<String>) {
                                     token_hash,
                                     combined_price: combined,
                                     timestamp_nanos: start_tsc.elapsed().as_nanos() as u64,
+                                    yes_size: *yes_size,
+                                    no_size: *no_size,
                                 });
                             }
                         }
