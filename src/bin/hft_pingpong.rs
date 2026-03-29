@@ -8,21 +8,13 @@ use chrono::{Utc, Timelike};
 use pingpong::hft_hot_path::run_sync_hot_path;
 use pingpong::hft_hot_path::BackgroundTask;
 
-/// Simplified market info
-#[derive(Debug, Clone)]
-struct MarketInfo {
-    condition_id: String,
-    token_ids: Vec<String>,
-    hours_until_resolve: i64,
-}
-
 /// Get current 15-minute periods for market slugs
 fn get_current_periods() -> Vec<i64> {
     let now = Utc::now();
     let minute = (now.minute() / 15) * 15;
     let period_start = now.with_minute(minute).unwrap().with_second(0).unwrap().with_nanosecond(0).unwrap();
     let base_ts = period_start.timestamp();
-    vec![base_ts, base_ts - 900, base_ts + 900]
+    vec![base_ts, base_ts - 900, base_ts + 900]  // current, prev 15m, next 15m
 }
 
 /// Fetch a single market by slug (same logic as old binary)
@@ -97,6 +89,16 @@ async fn fetch_tokens() -> Vec<String> {
     all_tokens
 }
 
+/// Simplified market info
+#[derive(Debug, Clone)]
+struct MarketInfo {
+    #[allow(dead_code)]
+    condition_id: String,
+    token_ids: Vec<String>,
+    #[allow(dead_code)]
+    hours_until_resolve: i64,
+}
+
 fn main() {
     println!("=======================================================");
     println!("🚀 INITIALIZING POLYMARKET HFT ENGINE (Unified)");
@@ -142,14 +144,19 @@ fn main() {
         })
         .expect("Failed to spawn background thread");
 
-    // 3. Pin Hot Path to isolated CPU core
-    if let Some(core_ids) = core_affinity::get_core_ids() {
-        for core in core_ids {
-            if core.id == 1 {
-                if core_affinity::set_for_current(core) {
-                    println!("🔒 [HFT] Pinned to core {}", core.id);
-                }
-                break;
+    // 3. Pin Hot Path to isolated CPU core (using direct syscall)
+    #[cfg(target_os = "linux")]
+    {
+        use std::mem::size_of;
+        // CPU_SET is a bitmask, we want CPU 1
+        let mut cpu_set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::CPU_SET(1, &mut cpu_set);
+            if libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &cpu_set) == 0 {
+                let cpu = libc::sched_getcpu();
+                println!("🔒 [HFT] Pinned to CPU 1 (currently on CPU {})", cpu);
+            } else {
+                eprintln!("⚠️ [HFT] Failed to pin to CPU 1, continuing on default core");
             }
         }
     }

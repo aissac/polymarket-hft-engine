@@ -55,6 +55,7 @@ simd-json = "0.14"
 crossbeam-channel = "0.5"
 minstant = "0.1"
 core_affinity = "0.8"
+libc = "0.2"
 
 
 [[bin]]
