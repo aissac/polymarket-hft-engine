@@ -43,6 +43,11 @@ polymarket-client-sdk = { version = "0.3", features = ["ws", "tracing"] }
 
 # Alloy for signing (required by polymarket-client-sdk)
 alloy = { version = "1.7", features = ["sol-types", "signer-local"] }
+# Direct alloy crates for signing
+alloy-primitives = "1.5"
+alloy-sol-types = "1.5"
+alloy-signer = "1.0"
+alloy-signer-local = "1.0"
 
 # Secrets management
 secrecy = "0.8"
@@ -57,6 +62,11 @@ minstant = "0.1"
 core_affinity = "0.8"
 libc = "0.2"
 rand = "0.8"
+# Signing and auth
+hex = "0.4"
+base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
 
 
 [[bin]]
@@ -66,3 +76,11 @@ path = "src/bin/hft_pingpong.rs"
 [[bin]]
 name = "pingpong"
 path = "src/main.rs"
+
+
+
+# Direct alloy crates for signing
+alloy-primitives = "1.5"
+alloy-sol-types = "1.5"
+alloy-signer = "1.0"
+alloy-signer-local = "1.0"

@@ -15,6 +15,13 @@ mod hot_path_optimized;
 mod websocket;
 // mod polyfill_integration; // Disabled - polyfill-rs bug
 pub mod production;
+// Live trading modules
+pub mod signing;
+// pub mod execution;
+// pub mod merge_worker;
+// pub mod stop_loss;
+// pub mod state;
+// pub mod user_ws;
 
 pub use orderbook::OrderBookTracker;
 pub use api::{PolyClient, SimplifiedMarket, TokenData};
@@ -22,6 +29,14 @@ pub use strategy::PingpongStrategy;
 pub use trading::{TradingEngine, TradingConfig, ArbitrageSignal};
 pub use maker_hybrid::{MakerSignal, MakerSide, InventoryTracker, evaluate_maker_opportunity};
 pub use production::{ProductionGuard, CircuitBreaker, LiquidityCheck, GasEstimate, OrderManager, TradeType, TradingStats};
+// Live trading exports
+pub use signing::{init_signer};
+
+// pub use execution::{submit_order_with_backoff, build_l2_headers, fetch_fee_rate};
+// pub use merge_worker::{run_merge_worker, MergeTask};
+// pub use stop_loss::{start_stop_loss_timer, execute_fak_order, ExecutionState, handle_trade_event};
+// pub use state::ExecutionState as HedgeState;
+// pub use user_ws::run_user_ws;
 
 /// Target combined cost - if YES_ask + NO_ask < this, we have arbitrage
 /// 0.95 gives us ~3% profit after 2% Polymarket fee + slippage buffer
