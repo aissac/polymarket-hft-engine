@@ -26,3 +26,5 @@ logs/
 
 # Docker
 .docker/
+nohup*.log
+nohup*.out
