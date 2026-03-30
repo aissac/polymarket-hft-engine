@@ -1,9 +1,8 @@
-//! HFT Hot Path - Fixed with side detection (buy/sell, not bids/asks)
+//! HFT Hot Path - Fixed with price_changes array parsing
 //!
-//! The WebSocket message format is:
-//! {"asset_id": "token", "side": "buy"|"sell", "price": "...", "size": "..."}
-//!
-//! NOT {"bids":[...],"asks":[...]} - that's wrong!
+//! WebSocket message formats:
+//! 1. Initial dump: {"event_type":"book","asset_id":"...","bids":[...],"asks":[...]}
+//! 2. Updates: {"price_changes":[{"asset_id":"...","side":"BUY/SELL","price":"...","size":"..."}]}
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -44,7 +43,7 @@ pub enum BackgroundTask {
     },
 }
 
-/// Run the hot path with correct buy/sell side detection
+/// Run the hot path with correct price_changes array parsing
 pub fn run_sync_hot_path<R: Read>(
     mut ws_stream: R,
     opportunity_tx: Sender<BackgroundTask>,
@@ -64,6 +63,9 @@ pub fn run_sync_hot_path<R: Read>(
     
     // Patterns for memchr
     let asset_pattern = memmem::Finder::new(b"\"asset_id\":\"");
+    let price_changes_pattern = memmem::Finder::new(b"\"price_changes\"");
+    let bids_pattern = memmem::Finder::new(b"\"bids\"");
+    let asks_pattern = memmem::Finder::new(b"\"asks\"");
     let side_pattern = memmem::Finder::new(b"\"side\":\"");
     let price_pattern = memmem::Finder::new(b"\"price\":\"");
     let size_pattern = memmem::Finder::new(b"\"size\":\"");
@@ -74,7 +76,7 @@ pub fn run_sync_hot_path<R: Read>(
     let start = Instant::now();
     let mut debug_printed = false;
     
-    println!("[HFT] 🔥 Starting hot path with buy/sell side detection...");
+    println!("[HFT] 🔥 Starting hot path with price_changes parsing...");
     println!("[HFT] Token pairs: {} pairs", token_pairs.len());
     
     loop {
@@ -93,6 +95,10 @@ pub fn run_sync_hot_path<R: Read>(
         
         let bytes = &buffer[..total_bytes];
         
+        // Determine message type: book snapshot or price_changes
+        let is_book = bids_pattern.find(bytes).is_some() && asks_pattern.find(bytes).is_some();
+        let is_price_changes = price_changes_pattern.find(bytes).is_some();
+        
         // Parse all tokens in this message
         let mut search_start = 0;
         let mut tokens_parsed = 0;
@@ -104,19 +110,8 @@ pub fn run_sync_hot_path<R: Read>(
                 let token_bytes = &bytes[token_start..token_start + token_end];
                 let token_hash = fast_hash(token_bytes);
                 
-                // Find side (buy or sell)
-                let side_search_start = token_start + token_end + 1;
-                let is_buy = if let Some(side_idx) = side_pattern.find(&bytes[side_search_start..]) {
-                    let side_val_start = side_search_start + side_idx + 9;
-                    if let Some(side_end) = memchr(b'"', &bytes[side_val_start..]) {
-                        let side_bytes = &bytes[side_val_start..side_val_start + side_end];
-                        // side is "buy" or "sell"
-                        side_bytes == b"buy"
-                    } else { false }
-                } else { false };
-                
                 // Find price
-                let price_search_start = side_search_start;
+                let price_search_start = token_start + token_end + 1;
                 if let Some(price_idx) = price_pattern.find(&bytes[price_search_start..]) {
                     let price_val_start = price_search_start + price_idx + 9;
                     
@@ -131,21 +126,45 @@ pub fn run_sync_hot_path<R: Read>(
                             if let Some(size_end) = memchr(b'"', &bytes[size_start..]) {
                                 let size = parse_fixed_6(&bytes[size_start..size_start + size_end]);
                                 
+                                // Determine side based on message type
+                                println!("[DEBUG] is_book={} is_price_changes={}", is_book, is_price_changes);
+                                    let is_bid = if is_book {
+                                    // For book snapshots, check if we're in bids or asks section
+                                    let bids_idx = bids_pattern.find(bytes).unwrap_or(usize::MAX);
+                                    let asks_idx = asks_pattern.find(bytes).unwrap_or(usize::MAX);
+                                    let current_pos = search_start + asset_idx;
+                                    if bids_idx < asks_idx {
+                                        current_pos > bids_idx && current_pos < asks_idx
+                                    } else {
+                                        current_pos > bids_idx
+                                    }
+                                } else if is_price_changes {
+                                    // For price_changes, look for "side":"BUY" or "side":"SELL"
+                                    let side_search_start = token_start + token_end + 1;
+                                    if let Some(side_idx) = side_pattern.find(&bytes[side_search_start..]) {
+                                        let side_val_start = side_search_start + side_idx + 9;
+                                        if let Some(side_end) = memchr(b'"', &bytes[side_val_start..]) {
+                                            let side_bytes = &bytes[side_val_start..side_val_start + side_end];
+                                            println!("[DEBUG] side_bytes={:?}", std::str::from_utf8(side_bytes));
+                                            side_bytes == b"BUY" || side_bytes == b"buy"
+                                        } else { false }
+                                    } else { false }
+                                } else {
+                                    false
+                                };
+                                
                                 // Update orderbook based on side
-                                // buy = BID (someone wants to BUY at this price)
-                                // sell = ASK (someone wants to SELL at this price)
+                                // buy/BUY = BID (someone wants to BUY at this price)
+                                // sell/SELL = ASK (someone wants to SELL at this price)
                                 if let Some(state) = orderbook.get_mut(&token_hash) {
-                                    if is_buy {
+                                    if is_bid {
                                         state.update_bid(price, size);
                                     } else {
                                         state.update_ask(price, size);
                                     }
                                     tokens_parsed += 1;
-                                        if tokens_parsed <= 5 {
-                                            println!("[DEBUG] token={} side={} price={:.4} size={}", token_hash, if is_buy { "BUY" } else { "SELL" }, price as f64 / 1_000_000.0, size);
-                                        }
-                                        if tokens_parsed <= 5 {
-                                            println!("[DEBUG] token={} side={} price={:.4} size={}", token_hash, if is_buy { "BUY" } else { "SELL" }, price as f64 / 1_000_000.0, size);
+                                        if tokens_parsed <= 10 {
+                                            println!("[DEBUG] token={} is_bid={} price={:.4} size={}", token_hash, is_bid, price as f64 / 1_000_000.0, size);
                                         }
                                 }
                                 
