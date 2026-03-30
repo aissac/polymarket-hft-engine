@@ -15,6 +15,7 @@ use chrono::{Utc, Timelike};
 use reqwest::Client;
 
 use pingpong::hft_hot_path::run_sync_hot_path;
+use pingpong::websocket_reader::connect_to_polymarket;
 use pingpong::hft_hot_path::BackgroundTask;
 use pingpong::condition_map::{build_maps};
 use pingpong::token_map::hash_token;
@@ -123,11 +124,11 @@ fn main() {
                         let signer_address_iter = Arc::clone(&signer_address_bg);
                 match task {
                     BackgroundTask::EdgeDetected { 
-                        token_hash, 
-                        complement_hash,
-                        combined_price, 
-                        yes_size, 
-                        no_size,
+                        yes_token_hash, 
+                        no_token_hash,
+                        combined_ask, 
+                        yes_ask_size, 
+                        no_ask_size,
                         .. 
                     } => {
                         // Clone Arcs for the async task
@@ -144,11 +145,11 @@ fn main() {
                             let api_passphrase_task = Arc::clone(&api_passphrase_iter);
                             let signer_address_task = Arc::clone(&signer_address_iter);
                             process_edge(
-                                token_hash,
-                                complement_hash,
-                                yes_size,
-                                no_size,
-                                combined_price,
+                                yes_token_hash,
+                                no_token_hash,
+                                yes_ask_size,
+                                no_ask_size,
+                                combined_ask,
                                 &hash_map_task,
                                 &condition_map_task,
                                 &client_task,
@@ -182,7 +183,8 @@ fn main() {
     // 9. RUN HOT PATH (CPU PINNED, UNCHANGED)
     // ============================================================
     println!("🔥 Starting hot path (memchr parser, target: <1µs)...");
-    run_sync_hot_path(opportunity_tx, all_tokens, killswitch_hot, complement_map);
+    let ws_stream = connect_to_polymarket(all_tokens.clone());
+    run_sync_hot_path(ws_stream, opportunity_tx, all_tokens, killswitch_hot, complement_map, std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
 }
 
 /// Fetch tokens and build YES/NO pairs from Gamma API

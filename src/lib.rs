@@ -26,7 +26,9 @@ pub mod crypto_markets;
 pub mod token_map;
 pub mod background_wiring;
 pub mod maker_taker_routing;
+pub mod fees;
 pub mod user_ws;
+pub mod websocket_reader;
 
 pub use orderbook::OrderBookTracker;
 pub use api::{PolyClient, SimplifiedMarket, TokenData};
