@@ -38,6 +38,14 @@ pub struct WebSocketReader {
     buffer: Vec<u8>,
 }
 
+impl WebSocketReader {
+    /// Send a message over the WebSocket (for rollover subscriptions)
+    pub fn send(&mut self, msg: String) -> std::io::Result<()> {
+        self.socket.send(Message::Text(msg))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    }
+}
+
 impl Read for WebSocketReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         // If we have leftover data from previous message, return it

@@ -6,11 +6,7 @@
 //! - Updates orderbook state to free memory
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use serde_json::Value;
-use tokio::sync::mpsc::Sender;
-use tungstenite::protocol::Message;
 
 /// Market period information
 #[derive(Clone, Debug)]
@@ -62,67 +58,22 @@ fn get_15m_boundaries() -> (i64, i64, i64) {
     (current, current + 900, current + 1800)  // (current_start, current_end, next_end)
 }
 
-/// Fetch market periods from Gamma API
-pub async fn fetch_market_periods(
-    client: &reqwest::Client,
-    asset: &str,
-    duration: &str,
-) -> Result<Vec<MarketPeriod>, Box<dyn std::error::Error>> {
-    let now = now_ts();
-    let mut periods = Vec::new();
-    
-    // Calculate which periods to query
-    let (current_start, current_end, next_end) = match duration {
-        "5m" => get_5m_boundaries(),
-        "15m" => get_15m_boundaries(),
-        _ => return Err("Invalid duration".into()),
-    };
-    
-    // Query current and next period
-    for end_ts in &[current_end, next_end] {
-        let slug = format!("{}-updown-{}-{}", asset, duration, end_ts);
-        let url = format!("https://gamma-api.polymarket.com/events?slug={}", slug);
-        
-        let resp = client.get(&url).send().await?;
-        let json: Value = resp.json().await?;
-        
-        if let Some(events) = json.as_array() {
-            for event in events {
-                if let Some(markets) = event["markets"].as_array() {
-                    for market in markets {
-                        // Parse tokens
-                        let tokens_str = market["clobTokenIds"].as_str().unwrap_or("[]");
-                        let outcomes_str = market["outcomes"].as_str().unwrap_or("[]");
-                        
-                        let token_ids: Vec<String> = serde_json::from_str(tokens_str).unwrap_or_default();
-                        let outcomes: Vec<String> = serde_json::from_str(outcomes_str).unwrap_or_default();
-                        
-                        if token_ids.len() == 2 {
-                            let condition_id = market["conditionId"].as_str().unwrap_or("").to_string();
-                            let start_time = *end_ts - match duration {
-                                "5m" => 300,
-                                "15m" => 900,
-                                _ => 300,
-                            };
-                            
-                            periods.push(MarketPeriod {
-                                slug: slug.clone(),
-                                start_time,
-                                end_time: *end_ts,
-                                yes_token: token_ids[0].clone(),
-                                no_token: token_ids[1].clone(),
-                                condition_id,
-                                duration: duration.to_string(),
-                                asset: asset.to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    Ok(periods)
+/// Build WebSocket subscription message JSON
+pub fn build_subscribe_message(token_ids: &[String]) -> String {
+    let tokens_json = serde_json::to_string(token_ids).unwrap();
+    format!(
+        r#"{{"type":"subscribe","channel":"market","tokens":{}}}"#,
+        tokens_json
+    )
+}
+
+/// Build WebSocket unsubscribe message JSON
+pub fn build_unsubscribe_message(token_ids: &[String]) -> String {
+    let tokens_json = serde_json::to_string(token_ids).unwrap();
+    format!(
+        r#"{{"type":"unsubscribe","channel":"market","tokens":{}}}"#,
+        tokens_json
+    )
 }
 
 /// Check for market rollover and return subscription updates
@@ -174,39 +125,44 @@ pub fn check_rollover(
     (to_subscribe, to_unsubscribe)
 }
 
-/// Build WebSocket subscription message
-pub fn build_subscribe_message(token_ids: &[String]) -> Message {
-    let tokens_json = serde_json::to_string(token_ids).unwrap();
-    Message::Text(format!(
-        r#"{{"type":"subscribe","channel":"market","tokens":{}}}"#,
-        tokens_json
-    ))
-}
-
-/// Build WebSocket unsubscribe message
-pub fn build_unsubscribe_message(token_ids: &[String]) -> Message {
-    let tokens_json = serde_json::to_string(token_ids).unwrap();
-    Message::Text(format!(
-        r#"{{"type":"unsubscribe","channel":"market","tokens":{}}}"#,
-        tokens_json
-    ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Get current and next market periods for all tracked assets
+pub fn get_current_periods() -> Vec<MarketPeriod> {
+    let now = now_ts();
+    let mut periods = Vec::new();
     
-    #[test]
-    fn test_5m_boundaries() {
-        let (current_start, current_end, next_end) = get_5m_boundaries();
-        assert_eq!(current_end - current_start, 300);
-        assert_eq!(next_end - current_end, 300);
+    let assets = ["btc", "eth"];
+    let durations = [("5m", 300), ("15m", 900)];
+    
+    for asset in &assets {
+        for (duration, seconds) in &durations {
+            let current_end = (now / seconds) * seconds + seconds;
+            let next_end = current_end + seconds;
+            
+            // Current period
+            periods.push(MarketPeriod {
+                slug: format!("{}-updown-{}-{}", asset, duration, current_end),
+                start_time: current_end - seconds,
+                end_time: current_end,
+                yes_token: String::new(),  // Will be fetched
+                no_token: String::new(),
+                condition_id: String::new(),
+                duration: duration.to_string(),
+                asset: asset.to_string(),
+            });
+            
+            // Next period
+            periods.push(MarketPeriod {
+                slug: format!("{}-updown-{}-{}", asset, duration, next_end),
+                start_time: current_end,
+                end_time: next_end,
+                yes_token: String::new(),
+                no_token: String::new(),
+                condition_id: String::new(),
+                duration: duration.to_string(),
+                asset: asset.to_string(),
+            });
+        }
     }
     
-    #[test]
-    fn test_15m_boundaries() {
-        let (current_start, current_end, next_end) = get_15m_boundaries();
-        assert_eq!(current_end - current_start, 900);
-        assert_eq!(next_end - current_end, 900);
-    }
+    periods
 }

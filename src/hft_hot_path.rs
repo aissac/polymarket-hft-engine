@@ -34,6 +34,8 @@ pub enum BackgroundTask {
         max_ns: u64,
         avg_ns: u64,
         p99_ns: u64,
+
+/// Rollover command from background thread\npub enum RolloverCommand {\n    Subscribe { tokens: Vec<String> },\n    Unsubscribe { tokens: Vec<String> },\n}
         sample_count: u64,
     },
 }
