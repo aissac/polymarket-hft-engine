@@ -142,7 +142,7 @@ pub fn run_sync_hot_path<R: Read>(
                                     // For price_changes, look for "side":"BUY" or "side":"SELL"
                                     let side_search_start = token_start + token_end + 1;
                                     if let Some(side_idx) = side_pattern.find(&bytes[side_search_start..]) {
-                                        let side_val_start = side_search_start + side_idx + 9;
+                                        let side_val_start = side_search_start + side_idx + 8;
                                         if let Some(side_end) = memchr(b'"', &bytes[side_val_start..]) {
                                             let side_bytes = &bytes[side_val_start..side_val_start + side_end];
                                             println!("[DEBUG] side_bytes={:?}", std::str::from_utf8(side_bytes));
