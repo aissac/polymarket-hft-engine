@@ -83,6 +83,13 @@ fn main() {
     // Build token list for WebSocket subscription
     let all_tokens: Vec<String> = hash_to_id_arc.values().cloned().collect();
     println!("📊 Fetched {} tokens, {} YES/NO pairs", all_tokens.len(), pair_count);
+    
+    // Debug: print all tokens we're subscribing to
+    println!("[SUBSCRIBE] Tokens:");
+    for (i, token) in all_tokens.iter().enumerate() {
+        println!("[SUBSCRIBE]   #{} len={} hash={:x} token={}", 
+            i, token.len(), pingpong::token_map::hash_token(token), token);
+    }
 
     // ============================================================
     // 5. INITIALIZE SIGNER
