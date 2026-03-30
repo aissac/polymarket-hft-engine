@@ -29,6 +29,7 @@ fn fast_hash_token(bytes: &[u8]) -> u64 {
 const EDGE_THRESHOLD_U64: u64 = 980_000;   // $0.98 in micro-dollars
 const MIN_VALID_COMBINED_U64: u64 = 900_000; // $0.90 floor (below = broken data)
 const MAX_POSITION_U64: u64 = 5_000_000;
+const TARGET_SHARES: u64 = 100;  // Minimum shares to execute (NotebookLM guidance)
 
 /// Task sent to background execution thread
 pub enum BackgroundTask {
@@ -247,6 +248,12 @@ pub fn run_sync_hot_path(
                     if yes_ask_price == 0 || yes_ask_price >= 100 || 
                        no_ask_price == 0 || no_ask_price >= 100 {
                         continue; // Skip corrupted state
+                    }
+                    
+                    // MINIMUM SIZE CHECK (NotebookLM guidance)
+                    // Must have enough liquidity to complete the hedge
+                    if yes_ask_size < TARGET_SHARES || no_ask_size < TARGET_SHARES {
+                        continue; // Insufficient liquidity, skip
                     }
                     
                     // Combined ask in micro-dollars (cents * 10,000)
