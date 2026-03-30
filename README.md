@@ -1,112 +1,129 @@
-# Pingpong - Polymarket HFT Engine
+# 🏓 Pingpong: Polymarket HFT Engine
 
-Ultra-low latency arbitrage engine for Polymarket prediction markets, written in Rust.
+[![Rust](https://img.shields.io/badge/Rust-1.70+-orange.svg)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Status: DRY_RUN Validation](https://img.shields.io/badge/Status-DRY__RUN_Validation-brightgreen.svg)]()
 
-## Current Status
+**Pingpong** is an ultra-low latency, high-frequency trading (HFT) arbitrage engine purpose-built for Polymarket's Central Limit Order Book (CLOB). Written entirely in Rust, it is designed to exploit fleeting pricing inefficiencies in volatile 5-minute and 15-minute crypto up/down markets.
 
-✅ **HFT Engine v2 - Production Ready**
-✅ **Sub-microsecond latency** (avg 0.7µs, p99 < 5µs)
-✅ **Stateful WebSocket parsing** with batched message support
-✅ **Edge detection working** - detecting 3-8% arbitrage opportunities
-✅ **DRY RUN mode** - paper trading, no real orders
+Our ultimate goal: **Build the fastest Polymarket trading bot ever.** By combining zero-allocation orderbook parsing, real-time edge detection, and lightning-fast execution, Pingpong locks in risk-free arbitrage before human traders or slower bots even process the WebSocket frame.
 
-## Architecture
+---
 
-```
-polymarket-hft-engine/
-├── src/
-│   ├── bin/
-│   │   └── hft_pingpong_v2.rs   # Main binary with rollover support
-│   ├── hft_hot_path.rs          # Zero-allocation orderbook parser
-│   ├── state.rs                 # TokenBookState with bid/ask tracking
-│   ├── condition_map.rs         # Gamma API market fetcher
-│   ├── websocket_reader.rs     # WebSocket client with send capability
-│   └── market_rollover.rs       # Dynamic market subscription
-└── Cargo.toml
-```
+## 🎯 Project Description & Goals
 
-## How It Works
+In prediction markets, complementary outcomes must mathematically sum to 100% (or $1.00). Pingpong hunts for moments where liquidity fragmentation or sudden market "dumps" cause the combined ask price of `YES` and `NO` tokens to temporarily dip below $1.00.
 
-### 1. Token Pair Detection
-- Fetches active BTC/ETH 5m/15m up/down markets from Gamma API
-- Maps YES/NO token pairs for complement checking
-- Tracks current + next periods only (no stale markets)
+**The Strategy:**
+1. Monitor highly volatile BTC/ETH 5m and 15m markets.
+2. Track the top-of-book **Ask** prices for both `YES` and `NO` tokens.
+3. Fire an execution sequence when `YES_ASK + NO_ASK <= $0.98` (yielding a 2%+ gross edge).
+4. Utilize a Hybrid Maker-Taker routing system to harvest Polymarket's 0.36% maker rebates while absorbing the maximum 1.80% taker fee burden.
 
-### 2. Stateful WebSocket Parsing
-**Key insight from NotebookLM:** Polymarket WebSocket batches multiple tokens per message.
+## 🏗 Technical Architecture
 
-```
-Message structure:
-[
-  {"asset_id": "TOKEN1", "bids": [{"price": "0.44", "size": "5000"}], "asks": [...]},
-  {"asset_id": "TOKEN2", "bids": [...], "asks": [...]},
-  ...
-]
-```
+To achieve sub-microsecond latency, Pingpong strictly divides labor between a synchronous, CPU-pinned **Hot Path** and an asynchronous **Background Thread**:
 
-The parser tracks:
-- `current_token_hash` - set when hitting "asset_id":"..."
-- `is_bid` - set when entering "bids":[
-- `is_ask` - set when entering "asks":[
+* **The Hot Path (Sync):** An ultra-optimized loop listening to the Polymarket `market` WebSocket. It completely bypasses standard JSON deserialization (like `serde_json`), directly scanning raw byte arrays to maintain a fixed-size array representation of the orderbook.
+* **The Background Thread (Async/Tokio):** Receives an `OpportunitySnapshot` via a lock-free `crossbeam_channel`. It handles heavy asynchronous workloads including API requests, market rollovers, and simulating execution fills.
+* **Rollover Engine:** Automatically parses `startDate` and `endDate` from the Gamma API to cleanly drop expired markets and pre-subscribe to future 15-minute windows seamlessly.
 
-### 3. Edge Detection
-When YES_ASK + NO_ASK < $0.98, fire arbitrage signal:
-- Combined ask < 98¢ = at least 2% risk-free profit
-- Max position: $5 per trade
-- Tracks ghost rate (liquidity vanishing before fill)
+## 🧠 The Secret Sauce: Zero-Allocation Stateful Parsing
 
-## Performance
+Polymarket WebSocket payloads batch multiple token updates into a single JSON array, placing the `asset_id` uniquely at the top level of each object—*not* within the nested `bids` and `asks` arrays. Standard JSON parsing allocates memory for the entire DOM, which destroys HFT latency.
 
-| Metric | Value |
-|--------|-------|
-| Latency (avg) | 0.7µs |
-| Latency (p99) | < 5µs |
-| Messages/sec | 1,500+ |
-| Edge detection | Real-time |
+**Pingpong solves this using a Stateful `memchr` / `memmem` Parser:**
+1. As the scanner glides through the raw bytes, it identifies the top-level `"asset_id"` and temporarily caches the hash (converting bytes to `str` before hashing to avoid mismatches).
+2. It detects the `"bids":[` and `"asks":[` byte markers to flip an `is_bid` boolean state.
+3. As it encounters `"price":"` and `"size":"` tuples, it routes them to the correct fixed-size array in the orderbook map based on the active `asset_id` and `is_bid` state.
 
-## Building
+This innovation prevents mixed bid/ask corruption and ensures the engine never touches the heap during the per-message handling loop.
 
-```bash
-cargo build --release --bin hft_pingpong_v2
-```
+## ⚡ Performance Benchmarks
 
-## Running
+Pingpong operates at the physical limits of network and CPU performance:
 
-```bash
-# Dry run (no real orders)
-./target/release/hft_pingpong_v2
+| Metric | Measurement | Notes |
+|--------|-------------|-------|
+| **Hot Path Avg Latency** | `~0.7 µs` | Time from WS byte receive to internal state update |
+| **Hot Path p99 Latency** | `< 5.0 µs` | 99th percentile processing time under heavy volume |
+| **Orderbook Memory** | `O(1)` | Guaranteed stable memory footprint via tick arrays |
+| **Simulated Ghost Rate** | `~60%` | Frequency of liquidity vanishing before the 50ms execution sim |
+| **Executable Rate** | `~35-40%` | Arbitrage opportunities successfully hedged in DRY_RUN |
 
-# With private key (LIVE trading)
-POLYMARKET_PRIVATE_KEY=0x... ./target/release/hft_pingpong_v2
-```
+## ✨ Current Features
 
-## Key Fixes (March 2026)
+* **Sub-Microsecond Latency:** Custom byte-scanner for Polymarket payload parsing.
+* **Dynamic Token Discovery:** Automated tracking of active BTC/ETH 5m and 15m markets.
+* **Advanced Edge Detection:** Filters out extreme spreads (Combined Ask < $0.90) while capturing valid arbitrage <= $0.98.
+* **Thick/Thin Side Identification:** Automatically assesses Level 1 depth to assign the Maker leg to the stable side and the Taker leg to the volatile side.
+* **DRY_RUN Validation Mode:** Paper trading with built-in artificial latency delays (50ms Maker, 10ms Taker) to simulate real-world CLOB matching engine conditions.
+
+## 🗺 Roadmap to Production
+
+To claim the title of fastest Polymarket bot, our final path to live capital execution involves:
+- [ ] **L2 HMAC Authentication:** Integrate ECDSA / EIP-712 signing for secure `clob.polymarket.com` order submission.
+- [ ] **Hybrid Maker-Taker Execution:** Deploy the `GTC Post-Only` Maker order and `FAK` (Fill-And-Kill) Taker sequence.
+- [ ] **Hardware Stop-Loss:** Implement a strict 3-second timeout FAK order to dump naked Maker positions if the hedge fails.
+- [ ] **Colocation:** Deploy the compiled binary to AWS `eu-central-1` (or equivalent) to minimize network RTT to Polymarket's matching engine.
+
+## 🛠 Installation & Usage
+
+### Prerequisites
+* Rust 1.70+ (`cargo`)
+* Access to a Polygon RPC (for live deployment token allowances)
+
+### Setup
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/aissac/polymarket-hft-engine.git
+   cd polymarket-hft-engine
+   ```
+2. Configure your environment:
+   ```bash
+   cp .env.example .env
+   # Edit .env with your POLYMARKET_PRIVATE_KEY and RPC URL
+   ```
+3. Build for maximum performance:
+   ```bash
+   cargo build --release --bin hft_pingpong_v2
+   ```
+4. Run the engine (defaults to `DRY_RUN` mode):
+   ```bash
+   ./target/release/hft_pingpong_v2
+   ```
+
+## 🤝 Contributing
+
+We are building a community of low-latency enthusiasts. Pull requests are welcome!
+* **Performance:** If your PR touches `src/hft_hot_path.rs`, you **must** include criterion benchmark outputs proving your changes do not regress the sub-microsecond latency.
+* **Features:** Please open an issue to discuss architectural changes before committing heavy asynchronous workloads to the background thread.
+
+## ⚠️ Disclaimer
+
+This software is for educational and research purposes only. High-frequency trading and arbitrage on cryptocurrency prediction markets involves severe financial risk. The developers take no responsibility for financial losses incurred by running this software with live capital. Always thoroughly validate your setup in `DRY_RUN` mode first.
+
+---
+
+## 📚 Key Insights from Development
 
 ### Token Hash Mismatch (SOLVED)
-- **Problem:** `hash_token(str)` and `fast_hash(bytes)` produced different hashes
-- **Solution:** Convert bytes to str before hashing: `fast_hash_token(bytes)` uses `str::from_utf8()`
+Standard Rust `Hasher` produces different hashes for `&str` vs `&[u8]`. Our `fast_hash_token()` converts bytes to UTF-8 string before hashing to ensure consistency with Gamma API token IDs.
 
 ### Stateful Parsing (SOLVED)
-- **Problem:** Top-level `asset_id` confused parser; all entries marked as ASK
-- **Solution:** State machine tracks current token and side as we scan through batched messages
-- **NotebookLM insight:** asset_id is ONLY at top level of each market object, NOT inside each bid/ask
+NotebookLM helped us discover that Polymarket batches multiple tokens per WebSocket message. The `asset_id` appears only at the TOP LEVEL of each market object, not inside each bid/ask entry. Our state machine tracks:
+- `current_token_hash` → set on `"asset_id":"..."`  
+- `is_bid` → set on `"bids":[`  
+- `is_ask` → set on `"asks":[`
 
-## Environment Variables
+## 📊 Current Results
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `POLYMARKET_PRIVATE_KEY` | For live | EIP-712 signing key |
-| `TELEGRAM_BOT_TOKEN` | No | Telegram notifications |
-| `TELEGRAM_CHAT_ID` | No | Telegram chat ID |
+```
+🎯 EDGE DETECTED: Combined Ask = $0.92 (8% profit!)
+🎯 EDGE DETECTED: Combined Ask = $0.97 (3% profit!)
+```
 
-## Ghost Simulation
-
-The bot tracks "ghost" opportunities - edges that vanish before execution:
-- **Ghost rate:** ~60% (liquidity disappears after network RTT)
-- **Executable rate:** ~35% (real opportunities)
-- **Partial rate:** ~5% (partial fills)
-
-This validates NotebookLM's prediction that live fill rate would be lower than dry run's 100%.
+The bot is actively detecting arbitrage opportunities in real-time with sub-microsecond latency.
 
 ## License
 
