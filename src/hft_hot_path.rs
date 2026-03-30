@@ -1,5 +1,6 @@
-//! HFT Hot Path - Fixed with price_changes array parsing
-//! Clean version without debug output
+//! HFT Hot Path - With Rollover Support
+//!
+//! Sub-microsecond orderbook parsing with dynamic market subscriptions
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -8,14 +9,17 @@ use std::io::Read;
 use std::time::Instant;
 use memchr::memchr;
 use memchr::memmem;
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Sender, Receiver, TryRecvError};
 
-use crate::state::{TokenBookState, OpportunitySnapshot, fast_hash, parse_fixed_6};
+use crate::state::{TokenBookState, fast_hash, parse_fixed_6};
+use crate::websocket_reader::WebSocketReader;
+use crate::market_rollover::{build_subscribe_message, build_unsubscribe_message};
 
 const EDGE_THRESHOLD_U64: u64 = 980_000;
 const MIN_VALID_COMBINED_U64: u64 = 900_000;
 const MAX_POSITION_U64: u64 = 5_000_000;
 
+/// Task sent to background execution thread
 pub enum BackgroundTask {
     EdgeDetected {
         yes_token_hash: u64,
@@ -34,19 +38,28 @@ pub enum BackgroundTask {
         max_ns: u64,
         avg_ns: u64,
         p99_ns: u64,
-
-/// Rollover command from background thread\npub enum RolloverCommand {\n    Subscribe { tokens: Vec<String> },\n    Unsubscribe { tokens: Vec<String> },\n}
         sample_count: u64,
     },
 }
 
-pub fn run_sync_hot_path<R: Read>(
-    mut ws_stream: R,
+/// Rollover command from background thread
+pub enum RolloverCommand {
+    Subscribe { tokens: Vec<String> },
+    Unsubscribe { tokens: Vec<String> },
+}
+
+/// Run the hot path with rollover support
+/// 
+/// Uses WebSocketReader directly (not generic R: Read) to allow
+/// sending subscription messages without blocking.
+pub fn run_sync_hot_path(
+    mut ws_stream: WebSocketReader,
     opportunity_tx: Sender<BackgroundTask>,
     all_tokens: Vec<String>,
     killswitch: Arc<AtomicBool>,
     token_pairs: HashMap<u64, u64>,
     edge_counter: Arc<AtomicU64>,
+    rollover_rx: Receiver<RolloverCommand>,
 ) {
     let mut orderbook: HashMap<u64, TokenBookState> = HashMap::new();
     
@@ -68,9 +81,11 @@ pub fn run_sync_hot_path<R: Read>(
     let mut messages = 0u64;
     let start = Instant::now();
     let mut debug_printed = false;
+    let mut last_rollover_check = Instant::now();
     
-    println!("[HFT] 🔥 Starting hot path with price_changes parsing...");
+    println!("[HFT] 🔥 Starting hot path with rollover support");
     println!("[HFT] Token pairs: {} pairs", token_pairs.len());
+    println!("[HFT] 🔄 Rollover channel active");
     
     loop {
         if killswitch.load(Ordering::Relaxed) {
@@ -78,6 +93,56 @@ pub fn run_sync_hot_path<R: Read>(
             break;
         }
         
+        // Check for rollover commands (non-blocking)
+        if last_rollover_check.elapsed().as_secs() >= 1 {
+            loop {
+                match rollover_rx.try_recv() {
+                    Ok(RolloverCommand::Subscribe { tokens }) => {
+                        if !tokens.is_empty() {
+                            let msg = build_subscribe_message(&tokens);
+                            match ws_stream.send(msg) {
+                                Ok(_) => {
+                                    println!("[ROLLOVER] 📡 Subscribed to {} tokens", tokens.len());
+                                    // Add to orderbook
+                                    for token in &tokens {
+                                        orderbook.entry(fast_hash(token.as_bytes()))
+                                            .or_insert_with(TokenBookState::new);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[ROLLOVER] ❌ Subscribe failed: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    Ok(RolloverCommand::Unsubscribe { tokens }) => {
+                        if !tokens.is_empty() {
+                            let msg = build_unsubscribe_message(&tokens);
+                            match ws_stream.send(msg) {
+                                Ok(_) => {
+                                    println!("[ROLLOVER] 🗑️ Unsubscribed from {} tokens", tokens.len());
+                                    // Remove from orderbook to free memory
+                                    for token in &tokens {
+                                        orderbook.remove(&fast_hash(token.as_bytes()));
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[ROLLOVER] ❌ Unsubscribe failed: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        eprintln!("[ROLLOVER] ⚠️ Channel disconnected");
+                        break;
+                    }
+                }
+            }
+            last_rollover_check = Instant::now();
+        }
+        
+        // Read WebSocket message
         let n = match ws_stream.read(&mut buffer[total_bytes..]) {
             Ok(0) => break,
             Ok(n) => n,
@@ -158,23 +223,8 @@ pub fn run_sync_hot_path<R: Read>(
                                                 
                                                 let ec = edge_counter.fetch_add(1, Ordering::Relaxed);
                                                 if ec < 10 || ec % 100 == 0 {
-                                                    let yes_bid = yes_state.get_best_bid()
-                                                        .map(|(p, _)| p * 10_000)
-                                                        .unwrap_or(0);
-                                                    let no_bid = no_state.get_best_bid()
-                                                        .map(|(p, _)| p * 10_000)
-                                                        .unwrap_or(0);
-                                                    
-                                                    println!("[EDGE] 🎯 FOUND! Combined ASK = ${:.4}", 
+                                                    println!("[EDGE] 🎯 Combined ASK = ${:.4}", 
                                                         combined_ask as f64 / 1_000_000.0);
-                                                    println!("  YES Ask: ${:.4} (size: {}) | Bid: ${:.4}", 
-                                                        yes_ask_price as f64 / 100.0,
-                                                        yes_ask_size,
-                                                        yes_bid as f64 / 1_000_000.0);
-                                                    println!("  NO  Ask: ${:.4} (size: {}) | Bid: ${:.4}", 
-                                                        no_ask_price as f64 / 100.0,
-                                                        no_ask_size,
-                                                        no_bid as f64 / 1_000_000.0);
                                                 }
                                             }
                                         }
@@ -198,12 +248,11 @@ pub fn run_sync_hot_path<R: Read>(
             debug_printed = true;
             println!("[HFT] ✅ Warmed up after {} messages", messages);
             
-            // Print orderbook state
             let mut tokens_with_both = 0;
             let mut tokens_with_bid_only = 0;
             let mut tokens_with_ask_only = 0;
             
-            for (hash, state) in orderbook.iter() {
+            for state in orderbook.values() {
                 let has_bid = state.get_best_bid().is_some();
                 let has_ask = state.get_best_ask().is_some();
                 
@@ -220,32 +269,7 @@ pub fn run_sync_hot_path<R: Read>(
             println!("[HFT]   {} with both bid+ask", tokens_with_both);
             println!("[HFT]   {} with bid only", tokens_with_bid_only);
             println!("[HFT]   {} with ask only", tokens_with_ask_only);
-            // Iterate through each YES/NO pair to show Combined ASK
-            for (yes_hash, no_hash) in token_pairs.iter() {
-                if let (Some(yes_state), Some(no_state)) = (orderbook.get(yes_hash), orderbook.get(no_hash)) {
-                    if let (
-                        Some((yes_bid, _)), 
-                        Some((yes_ask, _)), 
-                        Some((no_bid, _)), 
-                        Some((no_ask, _))
-                    ) = (
-                        yes_state.get_best_bid(),
-                        yes_state.get_best_ask(),
-                        no_state.get_best_bid(),
-                        no_state.get_best_ask()
-                    ) {
-                        let combined_ask_cents = yes_ask + no_ask;
-                        println!(
-                            "[COMBINED] YES: Ask=${:.2} Bid=${:.2} | NO: Ask=${:.2} Bid=${:.2} => Combined=${:.2}",
-                            yes_ask as f64 / 100.0,
-                            yes_bid as f64 / 100.0,
-                            no_ask as f64 / 100.0,
-                            no_bid as f64 / 100.0,
-                            combined_ask_cents as f64 / 100.0
-                        );
-                    }
-                }
-            }        }
+        }
     }
     
     let elapsed = start.elapsed();
