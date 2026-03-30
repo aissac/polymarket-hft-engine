@@ -26,8 +26,8 @@ fn fast_hash_token(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-const EDGE_THRESHOLD_U64: u64 = 980_000;
-const MIN_VALID_COMBINED_U64: u64 = 900_000;
+const EDGE_THRESHOLD_U64: u64 = 980_000;   // $0.98 in micro-dollars
+const MIN_VALID_COMBINED_U64: u64 = 900_000; // $0.90 floor (below = broken data)
 const MAX_POSITION_U64: u64 = 5_000_000;
 
 /// Task sent to background execution thread
@@ -78,10 +78,6 @@ pub fn run_sync_hot_path(
     
     let price_pattern = memmem::Finder::new(b"\"price\":\"");
     let size_pattern = memmem::Finder::new(b"\"size\":\"");
-    let asset_pattern = memmem::Finder::new(b"\"asset_id\":\"");
-    let side_pattern = memmem::Finder::new(b"\"side\":\"");
-    let bids_start_pattern = memmem::Finder::new(b"\"bids\":[");
-    let asks_start_pattern = memmem::Finder::new(b"\"asks\":[");
     
     let mut buffer = vec![0u8; 1024 * 1024];
     let mut total_bytes = 0;
@@ -94,12 +90,8 @@ pub fn run_sync_hot_path(
     println!("[HFT] 🔥 Starting hot path with rollover support");
     println!("[HFT] Token pairs: {} pairs", token_pairs.len());
     println!("[HFT] 🔄 Rollover channel active");
-    
-    // Debug: print ALL token hashes we expect
-    println!("[HFT] Expected token hashes:");
-    for (hash, token) in token_pairs.iter() {
-        println!("[HFT]   hash={:x} -> complement={:x}", hash, token);
-    }
+    println!("[HFT] Edge threshold: ${:.2}", EDGE_THRESHOLD_U64 as f64 / 1_000_000.0);
+    println!("[HFT] Valid range: ${:.2} - ${:.2}", MIN_VALID_COMBINED_U64 as f64 / 1_000_000.0, EDGE_THRESHOLD_U64 as f64 / 1_000_000.0);
 
     loop {
         if killswitch.load(Ordering::Relaxed) {
@@ -165,11 +157,9 @@ pub fn run_sync_hot_path(
         let bytes = &buffer[..total_bytes];
         
         // Stateful parsing for batched WebSocket messages
-        // Message structure: [{"asset_id":"...", "bids":[{price,size}...], "asks":[...]}, {...}]
         let mut current_token_hash: Option<u64> = None;
         let mut is_bid = false;
         let mut in_array = false;
-        let mut parse_debug_count = 0u64;
         
         let mut pos = 0;
         while pos < bytes.len() {
@@ -180,10 +170,6 @@ pub fn run_sync_hot_path(
                 let token_start = pos + 12;
                 if let Some(token_end) = memchr(b'"', &bytes[token_start..]) {
                     current_token_hash = Some(fast_hash_token(&bytes[token_start..token_start + token_end]));
-                    if messages <= 3 && parse_debug_count < 5 {
-                        parse_debug_count += 1;
-                        println!("[PARSE] Found asset_id, hash={:x}", current_token_hash.unwrap());
-                    }
                     pos = token_start + token_end + 1;
                     continue;
                 }
@@ -221,29 +207,21 @@ pub fn run_sync_hot_path(
                     // Find size after price
                     let size_search = price_start + price_end + 1;
                     if let Some(size_idx) = size_pattern.find(&bytes[size_search..]) {
-                        let size_start_inner = size_search + size_idx + 8;
-                        if let Some(size_end) = memchr(b'"', &bytes[size_start_inner..]) {
-                            let size = parse_fixed_6(&bytes[size_start_inner..size_start_inner + size_end]);
+                        let size_start = size_search + size_idx + 8;
+                        if let Some(size_end) = memchr(b'"', &bytes[size_start..]) {
+                            let size = parse_fixed_6(&bytes[size_start..size_start + size_end]);
                             
                             // Apply to current token
                             if let Some(token_hash) = current_token_hash {
                                 if let Some(state) = orderbook.get_mut(&token_hash) {
                                     if is_bid {
                                         state.update_bid(price, size);
-                                        if messages <= 3 && parse_debug_count < 10 {
-                                            println!("[BID] token={:x} price={:.2}¢ size={:.2}", 
-                                                token_hash, price as f64 / 10_000.0, size as f64 / 1_000_000.0);
-                                        }
                                     } else {
                                         state.update_ask(price, size);
-                                        if messages <= 3 && parse_debug_count < 10 {
-                                            println!("[ASK] token={:x} price={:.2}¢ size={:.2}", 
-                                                token_hash, price as f64 / 10_000.0, size as f64 / 1_000_000.0);
-                                        }
                                     }
                                 }
                             }
-                            pos = size_start_inner + size_end + 1;
+                            pos = size_start + size_end + 1;
                             continue;
                         }
                     }
@@ -255,7 +233,7 @@ pub fn run_sync_hot_path(
             pos += 1;
         }
         
-        // Edge detection: check complement pairs
+        // Edge detection: check complement pairs with sanity checks
         for (&token_hash, &complement_hash) in token_pairs.iter() {
             if let (Some(yes_state), Some(no_state)) = 
                 (orderbook.get(&token_hash), orderbook.get(&complement_hash)) {
@@ -264,21 +242,33 @@ pub fn run_sync_hot_path(
                         Some((no_ask_price, no_ask_size))) = 
                     (yes_state.get_best_ask(), no_state.get_best_ask()) {
                     
+                    // SANITY CHECK: Polymarket prices must be 1-99 cents
+                    // If we get 0 or 100+, the orderbook state is corrupted
+                    if yes_ask_price == 0 || yes_ask_price >= 100 || 
+                       no_ask_price == 0 || no_ask_price >= 100 {
+                        continue; // Skip corrupted state
+                    }
+                    
+                    // Combined ask in micro-dollars (cents * 10,000)
                     let combined_ask = yes_ask_price * 10_000 + no_ask_price * 10_000;
                     
                     pair_checks += 1;
                     if pair_checks <= 10 || pair_checks % 100 == 0 {
                         println!("[DEBUG] Combined ASK = ${:.4} (YES={:.2}¢, NO={:.2}¢) | pair_checks={}", 
                             combined_ask as f64 / 1_000_000.0,
-                            yes_ask_price as f64 / 10_000.0,
-                            no_ask_price as f64 / 10_000.0,
+                            yes_ask_price as f64,  // Already in cents
+                            no_ask_price as f64,   // Already in cents
                             pair_checks);
                     }
                     
+                    // Only trigger if mathematically valid
                     if combined_ask <= EDGE_THRESHOLD_U64 && combined_ask >= MIN_VALID_COMBINED_U64 {
                         let ec = edge_counter.fetch_add(1, Ordering::Relaxed);
                         if ec < 10 || ec % 100 == 0 {
-                            println!("[EDGE] 🎯 Combined ASK = ${:.4}", combined_ask as f64 / 1_000_000.0);
+                            println!("[EDGE] 🎯 Combined ASK = ${:.4} (YES={:.2}¢, NO={:.2}¢)", 
+                                combined_ask as f64 / 1_000_000.0,
+                                yes_ask_price as f64,
+                                no_ask_price as f64);
                         }
                         
                         let capped_yes_size = std::cmp::min(yes_ask_size, MAX_POSITION_U64);
