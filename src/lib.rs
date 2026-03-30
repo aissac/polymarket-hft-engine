@@ -87,3 +87,4 @@ mod tests {
         assert!(profit < 0.05); // ~$0.03
     }
 }
+pub mod market_rollover;
