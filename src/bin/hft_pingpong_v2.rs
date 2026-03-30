@@ -16,11 +16,11 @@ use reqwest::Client;
 
 use pingpong::hft_hot_path::run_sync_hot_path;
 use pingpong::hft_hot_path::BackgroundTask;
-use pingpong::token_map::{hash_token, build_maps};
+use pingpong::condition_map::{build_maps};
+use pingpong::token_map::hash_token;
 use pingpong::background_wiring::process_edge;
 use pingpong::execution::{build_hft_client, pre_warm_connections};
 use pingpong::signing::init_signer;
-use pingpong::condition_map::MARKET_SLUGS;
 
 /// Target combined price threshold ($0.94 = 940,000 micro-USDC)
 const EDGE_THRESHOLD_U64: u64 = 940_000;
@@ -64,12 +64,20 @@ fn main() {
     // 4. BUILD TOKEN MAPS (NotebookLM Integration)
     // ============================================================
     println!("🔨 Building token maps from Gamma API...");
-    let (hash_to_id, id_to_condition) = temp_rt.block_on(async {
-        build_maps(&http_client, MARKET_SLUGS).await
+    let (hash_to_id, id_to_condition, complement_map) = temp_rt.block_on(async {
+        build_maps(&http_client).await
     });
+    
+    if hash_to_id.is_empty() {
+        panic!("CRITICAL: 0 tokens fetched from Gamma API. Halting to prevent WebSocket spam.");
+    }
     
     let hash_to_id_arc = Arc::new(hash_to_id);
     let id_to_condition_arc = Arc::new(id_to_condition);
+    let pair_count = complement_map.len() / 2;
+    let complement_map_arc = Arc::new(complement_map.clone());
+    
+    let all_tokens: Vec<String> = hash_to_id_arc.values().cloned().collect();
 
     // ============================================================
     // 5. INITIALIZE SIGNER
@@ -81,11 +89,9 @@ fn main() {
     // 6. FETCH TOKENS WITH CORRECT YES/NO PAIRS
     // ============================================================
     println!("📊 Fetching token list from Gamma API...");
-    let (all_tokens, token_pairs, _token_strings) = temp_rt.block_on(async {
-        fetch_tokens_with_pairs(&http_client, MARKET_SLUGS).await
-    });
     
-    println!("📊 Fetched {} tokens, {} YES/NO pairs", all_tokens.len(), token_pairs.len() / 2);
+    
+    println!("📊 Fetched {} tokens, {} YES/NO pairs", all_tokens.len(), pair_count);
 
     // ============================================================
     // 7. CREATE CHANNELS
@@ -176,7 +182,7 @@ fn main() {
     // 9. RUN HOT PATH (CPU PINNED, UNCHANGED)
     // ============================================================
     println!("🔥 Starting hot path (memchr parser, target: <1µs)...");
-    run_sync_hot_path(opportunity_tx, all_tokens, killswitch_hot, token_pairs);
+    run_sync_hot_path(opportunity_tx, all_tokens, killswitch_hot, complement_map);
 }
 
 /// Fetch tokens and build YES/NO pairs from Gamma API

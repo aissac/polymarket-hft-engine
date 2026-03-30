@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-const EDGE_THRESHOLD_U64: u64 = 940_000; // Upper bound
+const EDGE_THRESHOLD_U64: u64 = 980_000; // TEMPORARY: $0.98 for validation (change to 940000 for live) // Upper bound
 const MIN_VALID_COMBINED_U64: u64 = 900_000; // Lower bound (reject stale transient states)
 const MAX_POSITION_U64: u64 = 5_000_000;
 

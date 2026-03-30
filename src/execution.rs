@@ -54,7 +54,7 @@ pub fn build_l2_headers(
 /// Build optimized HTTP/2 client for HFT (NotebookLM Fix #2)
 pub fn build_hft_client() -> Client {
     Client::builder()
-        .http2_prior_knowledge()                    // Force HTTP/2
+        // http2_prior_knowledge() // Incompatible with HTTPS/TLS                    // Force HTTP/2
         .tcp_keepalive(Duration::from_secs(60))     // Keep connections warm
         .pool_idle_timeout(Duration::from_secs(90)) // Prevent dropping idle sockets
         .pool_max_idle_per_host(10)                 // Pool connections per host

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use reqwest::Client;
 
-use crate::token_map::{hash_token, build_maps};
+use crate::token_map::hash_token;
 use crate::execution::{create_order_payload, submit_order, build_hft_client, pre_warm_connections};
 use crate::maker_taker_routing::{determine_maker_taker, MakerTakerAssignment};
 use crate::signing::init_signer;
