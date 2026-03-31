@@ -34,7 +34,7 @@ pub fn connect_to_polymarket(tokens: Vec<String>) -> WebSocketReader {
 
 /// Wrapper to implement Read for WebSocket
 pub struct WebSocketReader {
-    socket: tungstenite::WebSocket<MaybeTlsStream<TcpStream>>,
+    pub socket: tungstenite::WebSocket<MaybeTlsStream<TcpStream>>,
     buffer: Vec<u8>,
 }
 

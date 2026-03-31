@@ -85,14 +85,6 @@ pub async fn process_edge(
     );
 
     println!();
-    println!("[EXEC] 🎯 Edge detected: combined=${:.4}", combined_f);
-    println!("[EXEC]   YES token: {}..{}", &yes_token_id[..10], &yes_token_id[yes_token_id.len()-6..]);
-    println!("[EXEC]   NO token:  {}..{}", &no_token_id[..10], &no_token_id[no_token_id.len()-6..]);
-    println!("[EXEC]   Condition: {}..{}", &condition_id[..10], &condition_id[condition_id.len()-6..]);
-    println!("[EXEC]   YES depth: {:.0}, NO depth: {:.0}", yes_size_f, no_size_f);
-    println!("[EXEC]   Thick side: {} (Maker)", maker.side);
-    println!("[EXEC]   Thin side: {} (Taker)", taker.side);
-    println!("[EXEC]   Net fee: ${:.4} (rebate ${:.4}, taker ${:.4})", net_fee, maker_rebate, taker_fee);
 
     // Step 5: In DRY_RUN, simulate the matching engine
     if dry_run {

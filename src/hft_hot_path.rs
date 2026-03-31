@@ -1,37 +1,27 @@
-//! HFT Hot Path - With Rollover Support
-//!
-//! Sub-microsecond orderbook parsing with dynamic market subscriptions
+//! HFT Hot Path - Rate Limited + Bi-directional Token Mapping
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::io::Read;
-use std::time::Instant;
+use std::time::{Instant, Duration};
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
+use crossbeam_channel::{Sender, Receiver};
 use memchr::memchr;
-use memchr::memmem;
-use crossbeam_channel::{Sender, Receiver, TryRecvError};
-
-use crate::state::{TokenBookState, parse_fixed_6};
+use rustc_hash::FxHashMap;
+use tungstenite::Message;
 use crate::websocket_reader::WebSocketReader;
-use crate::market_rollover::{build_subscribe_message, build_unsubscribe_message};
 
-/// Hash token bytes consistently with hash_token (convert to str first)
-#[inline]
-fn fast_hash_token(bytes: &[u8]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    use std::collections::hash_map::DefaultHasher;
-    let mut hasher = DefaultHasher::new();
-    let token_str = std::str::from_utf8(bytes).unwrap_or("");
-    token_str.hash(&mut hasher);
-    hasher.finish()
+const EVAL_RATE_LIMIT_MS: u64 = 100;
+const EDGE_THRESHOLD_U64: u64 = 980_000;
+const MIN_VALID_COMBINED_U64: u64 = 900_000;
+const TARGET_SHARES: u64 = 100;
+
+pub enum RolloverCommand {
+    AddPair(u64, u64),  // first_hash, second_hash
+    RemovePair(u64),
 }
 
-const EDGE_THRESHOLD_U64: u64 = 980_000;   // $0.98 in micro-dollars
-const MIN_VALID_COMBINED_U64: u64 = 900_000; // $0.90 floor (below = broken data)
-const MAX_POSITION_U64: u64 = 5_000_000;
-const TARGET_SHARES: u64 = 100;  // Minimum shares to execute (NotebookLM guidance)
-
-/// Task sent to background execution thread
 pub enum BackgroundTask {
     EdgeDetected {
         yes_token_hash: u64,
@@ -54,293 +44,362 @@ pub enum BackgroundTask {
     },
 }
 
-/// Rollover command from background thread
-pub enum RolloverCommand {
-    Subscribe { tokens: Vec<String> },
-    Unsubscribe { tokens: Vec<String> },
+pub struct EvalTracker {
+    last_eval: Instant,
 }
 
-/// Run the hot path with rollover support
+impl EvalTracker {
+    pub fn new() -> Self {
+        Self {
+            last_eval: Instant::now() - Duration::from_secs(1),
+        }
+    }
+
+    pub fn can_evaluate(&mut self, now: Instant) -> bool {
+        if now.duration_since(self.last_eval).as_millis() as u64 >= EVAL_RATE_LIMIT_MS {
+            self.last_eval = now;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TokenBookState {
+    pub best_bid_price: u64,
+    pub best_bid_size: u64,
+    pub best_ask_price: u64,
+    pub best_ask_size: u64,
+}
+
+impl TokenBookState {
+    pub fn new() -> Self {
+        Self {
+            best_bid_price: 0,
+            best_bid_size: 0,
+            best_ask_price: u64::MAX,
+            best_ask_size: 0,
+        }
+    }
+
+    pub fn update_bid(&mut self, price: u64, size: u64) {
+        if price > self.best_bid_price {
+            self.best_bid_price = price;
+            self.best_bid_size = size;
+        }
+    }
+
+    pub fn update_ask(&mut self, price: u64, size: u64) {
+        if price < self.best_ask_price {
+            self.best_ask_price = price;
+            self.best_ask_size = size;
+        }
+    }
+
+    pub fn get_best_bid(&self) -> Option<(u64, u64)> {
+        if self.best_bid_price > 0 {
+            Some((self.best_bid_price, self.best_bid_size))
+        } else {
+            None
+        }
+    }
+
+    pub fn get_best_ask(&self) -> Option<(u64, u64)> {
+        if self.best_ask_price < u64::MAX {
+            Some((self.best_ask_price, self.best_ask_size))
+        } else {
+            None
+        }
+    }
+}
+
+pub fn fast_hash(bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn parse_fixed_6(bytes: &[u8]) -> u64 {
+    let mut result: u64 = 0;
+    let mut decimal_seen = false;
+    let mut decimal_places = 0;
+
+    for &b in bytes {
+        if b == b'.' {
+            decimal_seen = true;
+            continue;
+        }
+        if b >= b'0' && b <= b'9' {
+            result = result * 10 + (b - b'0') as u64;
+            if decimal_seen {
+                decimal_places += 1;
+            }
+        }
+    }
+
+    while decimal_places < 6 {
+        result *= 10;
+        decimal_places += 1;
+    }
+
+    result
+}
+
 pub fn run_sync_hot_path(
     mut ws_stream: WebSocketReader,
     opportunity_tx: Sender<BackgroundTask>,
     all_tokens: Vec<String>,
     killswitch: Arc<AtomicBool>,
-    token_pairs: HashMap<u64, u64>,
+    mut token_pairs: HashMap<u64, (u64, u64)>,  // Bi-directional: hash -> (yes_hash, no_hash)
     edge_counter: Arc<AtomicU64>,
     rollover_rx: Receiver<RolloverCommand>,
 ) {
-    let mut orderbook: HashMap<u64, TokenBookState> = HashMap::new();
+    println!("⚡ Rate-Limited Hot Path Started (Bi-directional)");
+    println!("📊 Tracking {} token mappings", token_pairs.len());
+
+    let mut orderbook: FxHashMap<u64, TokenBookState> = FxHashMap::default();
+    let mut eval_trackers: FxHashMap<u64, EvalTracker> = FxHashMap::default();
     
-    for token in &all_tokens {
-        orderbook.entry(fast_hash_token(token.as_bytes()))
-            .or_insert_with(TokenBookState::new);
+    for &token_hash in token_pairs.keys() {
+        eval_trackers.insert(token_hash, EvalTracker::new());
     }
-    
-    let price_pattern = memmem::Finder::new(b"\"price\":\"");
-    let size_pattern = memmem::Finder::new(b"\"size\":\"");
-    
-    let mut buffer = vec![0u8; 1024 * 1024];
-    let mut total_bytes = 0;
+
+    for token in &all_tokens {
+        let hash = fast_hash(token.as_bytes());
+        orderbook.entry(hash).or_insert_with(TokenBookState::new);
+    }
+
     let mut messages = 0u64;
-    let mut pair_checks = 0u64;
+    let mut total_evals = 0u64;
+    let mut edges_found = 0u64;
     let start = Instant::now();
-    let mut debug_printed = false;
-    let mut last_rollover_check = Instant::now();
-    
-    println!("[HFT] 🔥 Starting hot path with rollover support");
-    println!("[HFT] Token pairs: {} pairs", token_pairs.len());
-    println!("[HFT] 🔄 Rollover channel active");
-    println!("[HFT] Edge threshold: ${:.2}", EDGE_THRESHOLD_U64 as f64 / 1_000_000.0);
-    println!("[HFT] Valid range: ${:.2} - ${:.2}", MIN_VALID_COMBINED_U64 as f64 / 1_000_000.0, EDGE_THRESHOLD_U64 as f64 / 1_000_000.0);
+    let mut last_report = Instant::now();
+    let mut last_eval_count = 0u64;
+
+    println!("⚡ Hot Path Armed. Waiting for WebSocket events...");
 
     loop {
         if killswitch.load(Ordering::Relaxed) {
-            println!("[HFT] Killswitch triggered, exiting");
+            println!("⚡ Killswitch triggered, exiting hot path");
             break;
         }
-        
-        // Check for rollover commands
-        if last_rollover_check.elapsed().as_millis() > 100 {
-            loop {
-                match rollover_rx.try_recv() {
-                    Ok(RolloverCommand::Subscribe { tokens }) => {
-                        if !tokens.is_empty() {
-                            let msg = build_subscribe_message(&tokens);
-                            match ws_stream.send(msg) {
-                                Ok(_) => {
-                                    println!("[ROLLOVER] 📡 Subscribed to {} tokens", tokens.len());
-                                    for token in &tokens {
-                                        orderbook.entry(fast_hash_token(token.as_bytes()))
-                                            .or_insert_with(TokenBookState::new);
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("[ROLLOVER] ⚠️ Subscribe failed: {}", e);
-                                }
-                            }
-                        }
-                    }
-                    Ok(RolloverCommand::Unsubscribe { tokens }) => {
-                        if !tokens.is_empty() {
-                            let msg = build_unsubscribe_message(&tokens);
-                            match ws_stream.send(msg) {
-                                Ok(_) => {
-                                    println!("[ROLLOVER] 🗑️ Unsubscribed from {} tokens", tokens.len());
-                                    for token in &tokens {
-                                        orderbook.remove(&fast_hash_token(token.as_bytes()));
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("[ROLLOVER] ⚠️ Unsubscribe failed: {}", e);
-                                }
-                            }
-                        }
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        eprintln!("[ROLLOVER] ⚠️ Channel disconnected");
-                        break;
-                    }
+
+        // Process rollover commands
+        while let Ok(cmd) = rollover_rx.try_recv() {
+            match cmd {
+                RolloverCommand::AddPair(first_hash, second_hash) => {
+                    println!("[ROLLOVER] Adding mapping: {} -> {}", first_hash, second_hash);
+                    token_pairs.insert(first_hash, (first_hash, second_hash));
+                    eval_trackers.insert(first_hash, EvalTracker::new());
+                    orderbook.entry(first_hash).or_insert_with(TokenBookState::new);
+                    orderbook.entry(second_hash).or_insert_with(TokenBookState::new);
+                }
+                RolloverCommand::RemovePair(hash) => {
+                    println!("[ROLLOVER] Removing mapping: {}", hash);
+                    token_pairs.remove(&hash);
+                    eval_trackers.remove(&hash);
                 }
             }
-            last_rollover_check = Instant::now();
         }
-        
-        // Read WebSocket message
-        let n = match ws_stream.read(&mut buffer[total_bytes..]) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(_) => break,
+
+        let msg = match ws_stream.socket.read() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("🚨 WebSocket read error: {}", e);
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
         };
-        total_bytes += n;
-        
-        let bytes = &buffer[..total_bytes];
-        
-        // Stateful parsing for batched WebSocket messages
-        let mut current_token_hash: Option<u64> = None;
-        let mut is_bid = false;
-        let mut in_array = false;
-        
-        let mut pos = 0;
-        while pos < bytes.len() {
-            let remaining = &bytes[pos..];
+
+        messages += 1;
+
+        if let Message::Text(text) = msg {
+            let bytes = text.as_bytes();
+            parse_and_update_orderbook(bytes, &mut orderbook, &token_pairs);
+
+            // Get all mappings to evaluate
+            let pairs: Vec<(u64, u64, u64)> = token_pairs.iter()
+                .map(|(&k, &(yes, no))| (k, yes, no))
+                .collect();
             
-            // Check for asset_id at TOP LEVEL (not inside bids/asks)
-            if remaining.starts_with(b"\"asset_id\":\"") && !in_array {
-                let token_start = pos + 12;
-                if let Some(token_end) = memchr(b'"', &bytes[token_start..]) {
-                    current_token_hash = Some(fast_hash_token(&bytes[token_start..token_start + token_end]));
-                    pos = token_start + token_end + 1;
-                    continue;
+            for (token_hash, yes_hash, no_hash) in pairs {
+                let now = Instant::now();
+                if let Some(tracker) = eval_trackers.get_mut(&token_hash) {
+                    if !tracker.can_evaluate(now) {
+                        continue;
+                    }
+                    total_evals += 1;
                 }
-            }
-            
-            // Check for bids array start
-            if remaining.starts_with(b"\"bids\":[") {
-                is_bid = true;
-                in_array = true;
-                pos += 9;
-                continue;
-            }
-            
-            // Check for asks array start
-            if remaining.starts_with(b"\"asks\":[") {
-                is_bid = false;
-                in_array = true;
-                pos += 9;
-                continue;
-            }
-            
-            // Check for end of arrays
-            if remaining.starts_with(b"]") && in_array {
-                in_array = false;
-                pos += 1;
-                continue;
-            }
-            
-            // Check for price (only inside arrays)
-            if in_array && remaining.starts_with(b"\"price\":\"") {
-                let price_start = pos + 9;
-                if let Some(price_end) = memchr(b'"', &bytes[price_start..]) {
-                    let price = parse_fixed_6(&bytes[price_start..price_start + price_end]);
+
+                // Debug: check orderbook state every 100 evals
+                if total_evals % 100 == 0 {
+                    let yes_has = orderbook.get(&yes_hash).map(|s| s.best_ask_price < u64::MAX).unwrap_or(false);
+                    let no_has = orderbook.get(&no_hash).map(|s| s.best_ask_price < u64::MAX).unwrap_or(false);
+                    if yes_has || no_has {
+                        println!("[EDGE DEBUG] Token {} | YES has data: {} | NO has data: {}", 
+                            token_hash, yes_has, no_has);
+                        if yes_has {
+                            if let Some(s) = orderbook.get(&yes_hash) {
+                                println!("  YES: bid={} ask={} size={}", s.best_bid_price, s.best_ask_price, s.best_ask_size);
+                            }
+                        }
+                        if no_has {
+                            if let Some(s) = orderbook.get(&no_hash) {
+                                println!("  NO: bid={} ask={} size={}", s.best_bid_price, s.best_ask_price, s.best_ask_size);
+                            }
+                        }
+                    }
+                }
+                
+                if let (Some(yes_state), Some(no_state)) = 
+                    (orderbook.get(&yes_hash), orderbook.get(&no_hash)) {
                     
-                    // Find size after price
-                    let size_search = price_start + price_end + 1;
-                    if let Some(size_idx) = size_pattern.find(&bytes[size_search..]) {
-                        let size_start = size_search + size_idx + 8;
-                        if let Some(size_end) = memchr(b'"', &bytes[size_start..]) {
-                            let size = parse_fixed_6(&bytes[size_start..size_start + size_end]);
+                    if let (Some((yes_ask_price, yes_ask_size)), 
+                            Some((no_ask_price, no_ask_size))) = 
+                        (yes_state.get_best_ask(), no_state.get_best_ask()) {
+                        
+                        // Debug: show why edge detection fails
+                        if total_evals % 50 == 0 {
+                            println!("[EDGE CHECK] YES price={} size={} | NO price={} size={}", 
+                                yes_ask_price, yes_ask_size, no_ask_price, no_ask_size);
                             
-                            // Apply to current token
-                            if let Some(token_hash) = current_token_hash {
-                                if let Some(state) = orderbook.get_mut(&token_hash) {
-                                    if is_bid {
-                                        state.update_bid(price, size);
-                                    } else {
-                                        state.update_ask(price, size);
-                                    }
+                            if yes_ask_price == 0 || yes_ask_price >= 100_000_000 {
+                                println!("  FAIL: YES price out of bounds");
+                            } else if no_ask_price == 0 || no_ask_price >= 100_000_000 {
+                                println!("  FAIL: NO price out of bounds");
+                            } else if yes_ask_size < TARGET_SHARES {
+                                println!("  FAIL: YES size {} < {}", yes_ask_size, TARGET_SHARES);
+                            } else if no_ask_size < TARGET_SHARES {
+                                println!("  FAIL: NO size {} < {}", no_ask_size, TARGET_SHARES);
+                            } else {
+                                let combined = yes_ask_price + no_ask_price;
+                                println!("  Combined: {} (threshold {}-{})", 
+                                    combined, MIN_VALID_COMBINED_U64, EDGE_THRESHOLD_U64);
+                                if combined < MIN_VALID_COMBINED_U64 {
+                                    println!("  FAIL: Combined too low");
+                                } else if combined > EDGE_THRESHOLD_U64 {
+                                    println!("  FAIL: Combined too high");
+                                } else {
+                                    println!("  PASS: Edge detected!");
                                 }
                             }
-                            pos = size_start + size_end + 1;
+                        }
+                        
+                        // Sanity checks
+                        if yes_ask_price == 0 || yes_ask_price >= 100_000_000 || 
+                           no_ask_price == 0 || no_ask_price >= 100_000_000 {
                             continue;
                         }
-                    }
-                    pos = price_start + price_end + 1;
-                    continue;
-                }
-            }
-            
-            pos += 1;
-        }
-        
-        // Edge detection: check complement pairs with sanity checks
-        for (&token_hash, &complement_hash) in token_pairs.iter() {
-            if let (Some(yes_state), Some(no_state)) = 
-                (orderbook.get(&token_hash), orderbook.get(&complement_hash)) {
-                
-                if let (Some((yes_ask_price, yes_ask_size)), 
-                        Some((no_ask_price, no_ask_size))) = 
-                    (yes_state.get_best_ask(), no_state.get_best_ask()) {
-                    
-                    // SANITY CHECK: Polymarket prices must be 1-99 cents
-                    // If we get 0 or 100+, the orderbook state is corrupted
-                    if yes_ask_price == 0 || yes_ask_price >= 100 || 
-                       no_ask_price == 0 || no_ask_price >= 100 {
-                        continue; // Skip corrupted state
-                    }
-                    
-                    // MINIMUM SIZE CHECK (NotebookLM guidance)
-                    // Must have enough liquidity to complete the hedge
-                    if yes_ask_size < TARGET_SHARES || no_ask_size < TARGET_SHARES {
-                        continue; // Insufficient liquidity, skip
-                    }
-                    
-                    // Combined ask in micro-dollars (cents * 10,000)
-                    let combined_ask = yes_ask_price * 10_000 + no_ask_price * 10_000;
-                    
-                    pair_checks += 1;
-                    if pair_checks <= 10 || pair_checks % 100 == 0 {
-                        println!("[DEBUG] Combined ASK = ${:.4} (YES={:.2}¢, NO={:.2}¢) | pair_checks={}", 
-                            combined_ask as f64 / 1_000_000.0,
-                            yes_ask_price as f64,  // Already in cents
-                            no_ask_price as f64,   // Already in cents
-                            pair_checks);
-                    }
-                    
-                    // Only trigger if mathematically valid
-                    if combined_ask <= EDGE_THRESHOLD_U64 && combined_ask >= MIN_VALID_COMBINED_U64 {
-                        let ec = edge_counter.fetch_add(1, Ordering::Relaxed);
-                        if ec < 10 || ec % 100 == 0 {
-                            println!("[EDGE] 🎯 Combined ASK = ${:.4} (YES={:.2}¢, NO={:.2}¢)", 
-                                combined_ask as f64 / 1_000_000.0,
-                                yes_ask_price as f64,
-                                no_ask_price as f64);
+
+                        if yes_ask_size < TARGET_SHARES || no_ask_size < TARGET_SHARES {
+                            continue;
                         }
-                        
-                        let capped_yes_size = std::cmp::min(yes_ask_size, MAX_POSITION_U64);
-                        let capped_no_size = std::cmp::min(no_ask_size, MAX_POSITION_U64);
-                        
-                        let (yes_bid, no_bid) = (
-                            yes_state.get_best_bid().map(|(p, _)| p).unwrap_or(0),
-                            no_state.get_best_bid().map(|(p, _)| p).unwrap_or(0)
-                        );
-                        
-                        let _ = opportunity_tx.try_send(BackgroundTask::EdgeDetected {
-                            yes_token_hash: token_hash,
-                            no_token_hash: complement_hash,
-                            yes_best_bid: yes_bid,
-                            yes_best_ask: yes_ask_price,
-                            yes_ask_size: capped_yes_size,
-                            no_best_bid: no_bid,
-                            no_best_ask: no_ask_price,
-                            no_ask_size: capped_no_size,
-                            combined_ask,
-                            timestamp_nanos: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_nanos() as u64,
-                        });
+
+                        let combined_ask = yes_ask_price + no_ask_price;
+
+                        if combined_ask <= EDGE_THRESHOLD_U64 && combined_ask >= MIN_VALID_COMBINED_U64 {
+                            edges_found += 1;
+                            edge_counter.fetch_add(1, Ordering::Relaxed);
+
+                            println!("🎯 [EDGE] Combined ASK=${:.4} (YES=${} NO=${})", 
+                                combined_ask as f64 / 1_000_000.0,
+                                yes_ask_price as f64 / 1_000_000.0,
+                                no_ask_price as f64 / 1_000_000.0);
+
+                            let _ = opportunity_tx.try_send(BackgroundTask::EdgeDetected {
+                                yes_token_hash: yes_hash,
+                                no_token_hash: no_hash,
+                                yes_best_bid: yes_state.best_bid_price,
+                                yes_best_ask: yes_ask_price,
+                                yes_ask_size: yes_ask_size,
+                                no_best_bid: no_state.best_bid_price,
+                                no_best_ask: no_ask_price,
+                                no_ask_size: no_ask_size,
+                                combined_ask,
+                                timestamp_nanos: 0,
+                            });
+                        }
                     }
                 }
             }
         }
-        
-        messages += 1;
-        total_bytes = 0;
-        
-        if messages % 100 == 0 {
-            println!("[HFT] Received {} messages, pair_checks={}", messages, pair_checks);
-        }
-        
-        if messages == 50 && !debug_printed {
-            debug_printed = true;
-            println!("[HFT] ✅ Warmed up after {} messages", messages);
-            
-            let mut tokens_with_both = 0;
-            let mut tokens_with_bid_only = 0;
-            let mut tokens_with_ask_only = 0;
-            
-            for state in orderbook.values() {
-                let has_bid = state.get_best_bid().is_some();
-                let has_ask = state.get_best_ask().is_some();
-                
-                if has_bid && has_ask {
-                    tokens_with_both += 1;
-                } else if has_bid {
-                    tokens_with_bid_only += 1;
-                } else if has_ask {
-                    tokens_with_ask_only += 1;
-                }
-            }
-            
-            println!("[HFT] Orderbook state: {} tokens", orderbook.len());
-            println!("[HFT]   {} with both bid+ask", tokens_with_both);
-            println!("[HFT]   {} with bid only", tokens_with_bid_only);
-            println!("[HFT]   {} with ask only", tokens_with_ask_only);
+
+        if last_report.elapsed() >= Duration::from_secs(1) {
+            let evals_this_sec = total_evals - last_eval_count;
+            println!("[METRICS] {}s | msg: {} | evals: {} | edges: {} | evals/sec: {} | pairs:{}",
+                start.elapsed().as_secs(),
+                messages,
+                total_evals,
+                edges_found,
+                evals_this_sec,
+                token_pairs.len()
+            );
+            last_eval_count = total_evals;
+            last_report = Instant::now();
         }
     }
-    
+
     let elapsed = start.elapsed();
     println!("[HFT] Processed {} messages in {:?}", messages, elapsed);
+    println!("[HFT] Total evaluations: {} | Edges found: {}", total_evals, edges_found);
+}
+
+fn parse_and_update_orderbook(
+    bytes: &[u8],
+    orderbook: &mut FxHashMap<u64, TokenBookState>,
+    token_pairs: &HashMap<u64, (u64, u64)>,
+) {
+    let mut current_token_hash: Option<u64> = None;
+    let mut is_bid = false;
+    let mut pos = 0;
+    let mut found_asset = 0u64;
+    let mut found_price = 0u64;
+
+    let asset_marker: &[u8] = b"\"asset_id\":\"";
+    let price_marker: &[u8] = b"\"price\":\"";
+    let buy_marker: &[u8] = b"\"side\":\"BUY\"";
+    let sell_marker: &[u8] = b"\"side\":\"SELL\"";
+
+    while pos < bytes.len() {
+        let remaining = &bytes[pos..];
+
+        if remaining.starts_with(asset_marker) {
+            let token_start = pos + asset_marker.len();
+            if let Some(token_end) = memchr(b'"', &bytes[token_start..]) {
+                current_token_hash = Some(fast_hash(&bytes[token_start..token_start + token_end]));
+                found_asset += 1;
+                pos = token_start + token_end + 1;
+                continue;
+            }
+        }
+
+        if remaining.starts_with(buy_marker) {
+            is_bid = true;
+        } else if remaining.starts_with(sell_marker) {
+            is_bid = false;
+        }
+
+        if remaining.starts_with(price_marker) {
+            let price_start = pos + price_marker.len();
+            if let Some(price_end) = memchr(b'"', &bytes[price_start..]) {
+                let price = parse_fixed_6(&bytes[price_start..price_start + price_end]);
+                found_price += 1;
+                
+                if let Some(token_hash) = current_token_hash {
+                    if let Some(state) = orderbook.get_mut(&token_hash) {
+                        if is_bid {
+                            state.update_bid(price, 100);
+                        } else {
+                            state.update_ask(price, 100);
+                        }
+                    }
+                }
+                pos = price_start + price_end + 1;
+                continue;
+            }
+        }
+
+        pos += 1;
+    }
 }

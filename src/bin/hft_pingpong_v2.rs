@@ -17,13 +17,13 @@ use chrono::{Utc, Timelike};
 use reqwest::Client;
 
 use pingpong::hft_hot_path::{run_sync_hot_path, BackgroundTask, RolloverCommand};
+use pingpong::market_rollover::run_rollover_thread;
 use pingpong::websocket_reader::connect_to_polymarket;
 use pingpong::condition_map::build_maps;
 use pingpong::token_map::hash_token;
 use pingpong::background_wiring::process_edge;
 use pingpong::execution::{build_hft_client, pre_warm_connections};
 use pingpong::signing::init_signer;
-use pingpong::market_rollover::{RolloverState, check_rollover, get_current_periods};
 
 /// Target combined price threshold ($0.94 = 940,000 micro-USDC)
 const EDGE_THRESHOLD_U64: u64 = 940_000;
@@ -85,8 +85,8 @@ fn main() {
     println!("📊 Fetched {} tokens, {} YES/NO pairs", all_tokens.len(), pair_count);
     
     // Debug: print all tokens we're subscribing to
-    println!("[SUBSCRIBE] Tokens:");
-    for (i, token) in all_tokens.iter().enumerate() {
+    println!("[SUBSCRIBE] {} tokens (first 5 only)", all_tokens.len());
+    for (i, token) in all_tokens.iter().take(5).enumerate() {
         println!("[SUBSCRIBE]   #{} len={} hash={:x} token={}", 
             i, token.len(), pingpong::token_map::hash_token(token), token);
     }
@@ -95,7 +95,7 @@ fn main() {
     // 5. INITIALIZE SIGNER
     // ============================================================
     let signer = Arc::new(init_signer(&private_key).expect("Failed to initialize signer"));
-    println!("✅ Signer initialized: {:?}", signer.address());
+    println!(" Signer initialized: {:?}", signer.address());
 
     // ============================================================
     // 6. CREATE CHANNELS
@@ -107,41 +107,20 @@ fn main() {
     // 7. SPAWN ROLLOVER CHECKER THREAD
     // ============================================================
     let rollover_client = Arc::clone(&http_client);
-    let mut rollover_state = RolloverState::new();
     
-    thread::spawn(move || {
-        println!("⏳ [ROLLOVER] Started monitoring for market transitions");
-        
-        loop {
-            thread::sleep(Duration::from_secs(60));
-            
-            let now = Utc::now();
-            let periods = get_current_periods();
-            
-            // Check for rollover (currently just logs - TODO: fetch actual tokens)
-            let (to_subscribe, to_unsubscribe) = check_rollover(&mut rollover_state, &periods);
-            
-            if !to_subscribe.is_empty() {
-                println!("[ROLLOVER] 📡 Would subscribe to {} tokens at {:02}:{:02}", 
-                    to_subscribe.len(), now.hour(), now.minute());
-                // TODO: Send actual tokens when token fetching is implemented
-                // if rollover_tx.send(RolloverCommand::Subscribe { tokens: to_subscribe }).is_err() {
-                //     eprintln!("[ROLLOVER] ⚠️ Channel disconnected");
-                //     break;
-                // }
-            }
-            
-            if !to_unsubscribe.is_empty() {
-                println!("[ROLLOVER] 🗑️ Would unsubscribe from {} tokens at {:02}:{:02}", 
-                    to_unsubscribe.len(), now.hour(), now.minute());
-            }
-            
-            println!("[ROLLOVER] 🔄 Checked at {:02}:{:02}:{:02} - {} periods tracked", 
-                now.hour(), now.minute(), now.second(), rollover_state.active_periods.len());
-        }
+    // Spawn rollover thread (blocking, uses reqwest blocking client)
+    let rollover_client = Arc::clone(&http_client);
+    let rollover_tx_clone = rollover_tx.clone();
+    
+    std::thread::spawn(move || {
+        // Create a tokio runtime for the async function
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            pingpong::market_rollover::run_rollover_thread(rollover_client, rollover_tx_clone).await;
+        });
     });
     
-    println!("✅ Rollover checker thread spawned (60s interval)");
+    println!(" Rollover thread spawned (15s polling)");
 
     // ============================================================
     // 8. SPAWN BACKGROUND EXECUTION THREAD
@@ -218,7 +197,9 @@ fn main() {
         });
     });
 
-    println!("✅ Background execution thread spawned");
+    println!(" Background execution thread spawned");
+    // Start heartbeat logging (1/sec summary)
+    pingpong::hft_metrics::start_heartbeat_thread();
 
     // ============================================================
     // 9. RUN HOT PATH WITH ROLLOVER CHANNEL
@@ -227,12 +208,20 @@ fn main() {
     println!("🔄 Rollover channel active - markets will transition seamlessly");
     
     let ws_stream = connect_to_polymarket(all_tokens.clone());
+    // Convert token_pairs to bi-directional map
+    let mut bidi_pairs: std::collections::HashMap<u64, (u64, u64)> = std::collections::HashMap::new();
+    for (&yes_hash, &no_hash) in complement_map.iter() {
+        bidi_pairs.insert(yes_hash, (yes_hash, no_hash));
+        bidi_pairs.insert(no_hash, (yes_hash, no_hash));
+    }
+    println!("Built bi-directional map: {} mappings", bidi_pairs.len());
+    
     run_sync_hot_path(
         ws_stream,
         opportunity_tx,
         all_tokens,
         killswitch_hot,
-        complement_map,
+        bidi_pairs,
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
         rollover_rx,
     );

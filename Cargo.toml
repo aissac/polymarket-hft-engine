@@ -6,6 +6,7 @@ edition = "2021"
 [workspace]
 
 [dependencies]
+rustc-hash = "2.0"
 dotenvy = "0.15"
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
@@ -89,3 +90,5 @@ alloy-signer-local = "1.0"
 [[bin]]
 name = "hft_pingpong_integrated"
 path = "src/bin/hft_pingpong_integrated.rs"
+
+# HFT optimizations

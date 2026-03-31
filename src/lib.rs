@@ -11,6 +11,7 @@ mod trading;
 mod maker_hybrid;
 mod simd_hot_path;
 pub mod hft_hot_path;
+pub mod market_rollover;
 mod hot_path_optimized;
 mod websocket;
 // mod polyfill_integration; // Disabled - polyfill-rs bug
@@ -43,7 +44,7 @@ pub use execution::{submit_order, build_l2_headers, fetch_fee_rate, create_order
 pub use merge_worker::{run_merge_worker, MergeTask};
 pub use stop_loss::{start_stop_loss_timer, execute_fak_order, handle_trade_event};
 pub use state::{ExecutionState as HedgeState, HedgeContext};
-pub use condition_map::{build_condition_map, MARKET_SLUGS};
+pub use condition_map::{build_maps, get_current_periods};
 pub use user_ws::run_user_ws;
 
 /// Target combined cost - if YES_ask + NO_ask < this, we have arbitrage
@@ -87,4 +88,4 @@ mod tests {
         assert!(profit < 0.05); // ~$0.03
     }
 }
-pub mod market_rollover;
+pub mod hft_metrics;
