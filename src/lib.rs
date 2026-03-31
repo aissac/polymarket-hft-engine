@@ -90,3 +90,4 @@ mod tests {
 }
 pub mod hft_metrics;
 pub mod jsonl_logger;
+pub mod resilient_runner;
