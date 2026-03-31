@@ -89,3 +89,4 @@ mod tests {
     }
 }
 pub mod hft_metrics;
+pub mod jsonl_logger;

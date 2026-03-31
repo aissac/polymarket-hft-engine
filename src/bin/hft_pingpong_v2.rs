@@ -20,7 +20,7 @@ use pingpong::hft_hot_path::{run_sync_hot_path, BackgroundTask, RolloverCommand}
 use pingpong::market_rollover::run_rollover_thread;
 use pingpong::websocket_reader::connect_to_polymarket;
 use pingpong::condition_map::build_maps;
-use pingpong::token_map::hash_token;
+// use pingpong::token_map::hash_token;
 use pingpong::background_wiring::process_edge;
 use pingpong::execution::{build_hft_client, pre_warm_connections};
 use pingpong::signing::init_signer;
@@ -102,6 +102,10 @@ fn main() {
     // ============================================================
     let (opportunity_tx, opportunity_rx) = bounded::<BackgroundTask>(1024);
     let (rollover_tx, rollover_rx) = bounded::<RolloverCommand>(64);
+    // Start JSONL logger thread
+    let (log_tx, log_rx) = crossbeam_channel::bounded(4096);
+    let _logger_handle = pingpong::jsonl_logger::JsonlLogger::start(log_rx);
+    println!("JSONL logger started");
 
     // ============================================================
     // 7. SPAWN ROLLOVER CHECKER THREAD
@@ -224,6 +228,7 @@ fn main() {
         bidi_pairs,
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
         rollover_rx,
+        log_tx.clone(),
     );
     
     println!("🛑 Hot path exited");

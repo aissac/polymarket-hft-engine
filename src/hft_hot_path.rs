@@ -11,6 +11,7 @@ use memchr::memchr;
 use rustc_hash::FxHashMap;
 use tungstenite::Message;
 use crate::websocket_reader::WebSocketReader;
+use crate::jsonl_logger::LogEvent;
 
 const EVAL_RATE_LIMIT_MS: u64 = 100;
 const EDGE_THRESHOLD_U64: u64 = 980_000;
@@ -154,6 +155,7 @@ pub fn run_sync_hot_path(
     mut token_pairs: HashMap<u64, (u64, u64)>,  // Bi-directional: hash -> (yes_hash, no_hash)
     edge_counter: Arc<AtomicU64>,
     rollover_rx: Receiver<RolloverCommand>,
+    log_tx: crossbeam_channel::Sender<LogEvent>,
 ) {
     println!("⚡ Rate-Limited Hot Path Started (Bi-directional)");
     println!("📊 Tracking {} token mappings", token_pairs.len());
@@ -261,29 +263,16 @@ pub fn run_sync_hot_path(
                         
                         // Debug: show why edge detection fails
                         if total_evals % 50 == 0 {
-                            println!("[EDGE CHECK] YES price={} size={} | NO price={} size={}", 
-                                yes_ask_price, yes_ask_size, no_ask_price, no_ask_size);
-                            
-                            if yes_ask_price == 0 || yes_ask_price >= 100_000_000 {
-                                println!("  FAIL: YES price out of bounds");
-                            } else if no_ask_price == 0 || no_ask_price >= 100_000_000 {
-                                println!("  FAIL: NO price out of bounds");
-                            } else if yes_ask_size < TARGET_SHARES {
-                                println!("  FAIL: YES size {} < {}", yes_ask_size, TARGET_SHARES);
-                            } else if no_ask_size < TARGET_SHARES {
-                                println!("  FAIL: NO size {} < {}", no_ask_size, TARGET_SHARES);
-                            } else {
-                                let combined = yes_ask_price + no_ask_price;
-                                println!("  Combined: {} (threshold {}-{})", 
-                                    combined, MIN_VALID_COMBINED_U64, EDGE_THRESHOLD_U64);
-                                if combined < MIN_VALID_COMBINED_U64 {
-                                    println!("  FAIL: Combined too low");
-                                } else if combined > EDGE_THRESHOLD_U64 {
-                                    println!("  FAIL: Combined too high");
-                                } else {
-                                    println!("  PASS: Edge detected!");
-                                }
-                            }
+                            let combined = yes_ask_price + no_ask_price;
+                            let is_dust = combined < MIN_VALID_COMBINED_U64;
+                            let _ = log_tx.try_send(LogEvent::EdgeCheck {
+                                yes_hash: yes_hash,
+                                no_hash: no_hash,
+                                yes_ask: yes_ask_price,
+                                no_ask: no_ask_price,
+                                combined: combined,
+                                is_dust: is_dust,
+                            });
                         }
                         
                         // Sanity checks
@@ -327,14 +316,15 @@ pub fn run_sync_hot_path(
 
         if last_report.elapsed() >= Duration::from_secs(1) {
             let evals_this_sec = total_evals - last_eval_count;
-            println!("[METRICS] {}s | msg: {} | evals: {} | edges: {} | evals/sec: {} | pairs:{}",
-                start.elapsed().as_secs(),
-                messages,
-                total_evals,
-                edges_found,
-                evals_this_sec,
-                token_pairs.len()
-            );
+            let _ = log_tx.try_send(LogEvent::Metric {
+                uptime: start.elapsed().as_secs(),
+                msgs: messages,
+                evals: total_evals,
+                edges: edges_found,
+                evals_sec: evals_this_sec as u64,
+                pairs: token_pairs.len() as u64,
+                dropped: 0,
+            });
             last_eval_count = total_evals;
             last_report = Instant::now();
         }
