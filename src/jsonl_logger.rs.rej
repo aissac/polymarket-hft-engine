@@ -1,0 +1,13 @@
+--- src/jsonl_logger.rs
++++ src/jsonl_logger.rs
+@@ -102,8 +104,8 @@ fn run_logger_thread(log_rx: Receiver<LogEvent>) {
+         match event {
+             LogEvent::Metric { uptime, msgs, evals, edges, evals_sec, pairs, dropped } => {
+                 write!(&mut cursor, 
+-                    {"dr":{}}n,
+-                    uptime, msgs, evals, edges, evals_sec, pairs, dropped
++                    {"missing":{}}n,
++                    uptime, msgs, evals, edges, evals_sec, pairs, dropped, valid_evals, missing_data
+                 ).unwrap();
+             },
+             LogEvent::Rollover { action, hash, end_time } => {

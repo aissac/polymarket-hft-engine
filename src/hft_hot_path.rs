@@ -164,6 +164,8 @@ pub fn run_sync_hot_path(
     edge_counter: Arc<AtomicU64>,
     rollover_rx: Receiver<RolloverCommand>,
     log_tx: crossbeam_channel::Sender<LogEvent>,
+    valid_evals: Arc<AtomicU64>,
+    missing_data: Arc<AtomicU64>,
 ) {
     println!("⚡ Rate-Limited Hot Path Started (Bi-directional)");
     println!("📊 Tracking {} token mappings", token_pairs.len());

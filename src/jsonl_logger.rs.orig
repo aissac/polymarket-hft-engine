@@ -19,8 +19,6 @@ pub enum LogEvent {
         evals_sec: u64,
         pairs: u64,
         dropped: u64,
-        valid_evals: u64,
-        missing_data: u64,
     },
     /// Rollover event
     Rollover {
