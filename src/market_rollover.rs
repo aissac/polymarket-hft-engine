@@ -145,7 +145,17 @@ pub async fn run_rollover_thread(
                             let yes_hash = hash_token(&yes_token);
                             let no_hash = hash_token(&no_token);
                             
-                            if let Err(e) = rollover_tx.send(RolloverCommand::AddPair(yes_hash, no_hash)) {
+                            // Pre-format WebSocket subscription payload (zero-allocation for hot path)
+                            let ws_sub_payload = format!(
+                                r#"{{"token_ids": ["{}", "{}"], "type": "price_changes"}}"#,
+                                yes_token, no_token
+                            );
+                            
+                            if let Err(e) = rollover_tx.send(RolloverCommand::AddPair {
+                                yes_hash,
+                                no_hash,
+                                ws_sub_payload,
+                            }) {
                                 eprintln!("🚨 [ROLLOVER] Channel disconnected: {}", e);
                                 return;
                             }
@@ -176,7 +186,11 @@ pub async fn run_rollover_thread(
             
             let expired_hash = hash_token(&expired_id);
             
-            let _ = rollover_tx.send(RolloverCommand::RemovePair(expired_hash));
+            let _ = rollover_tx.send(RolloverCommand::RemovePair {
+                                yes_hash: expired_hash,
+                                no_hash: 0,  // Not used for removal
+                                ws_unsub_payload: String::new(),  // Not sending unsub
+                            });
             tracked_markets.remove(&expired_id);
         }
     }

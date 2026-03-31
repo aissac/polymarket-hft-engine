@@ -19,8 +19,16 @@ const MIN_VALID_COMBINED_U64: u64 = 900_000;
 const TARGET_SHARES: u64 = 100;
 
 pub enum RolloverCommand {
-    AddPair(u64, u64),  // first_hash, second_hash
-    RemovePair(u64),
+    AddPair {
+        yes_hash: u64,
+        no_hash: u64,
+        ws_sub_payload: String,
+    },
+    RemovePair {
+        yes_hash: u64,
+        no_hash: u64,
+        ws_unsub_payload: String,
+    },
 }
 
 pub enum BackgroundTask {
@@ -190,17 +198,26 @@ pub fn run_sync_hot_path(
         // Process rollover commands
         while let Ok(cmd) = rollover_rx.try_recv() {
             match cmd {
-                RolloverCommand::AddPair(first_hash, second_hash) => {
-                    println!("[ROLLOVER] Adding mapping: {} -> {}", first_hash, second_hash);
-                    token_pairs.insert(first_hash, (first_hash, second_hash));
-                    eval_trackers.insert(first_hash, EvalTracker::new());
-                    orderbook.entry(first_hash).or_insert_with(TokenBookState::new);
-                    orderbook.entry(second_hash).or_insert_with(TokenBookState::new);
+                RolloverCommand::AddPair { yes_hash, no_hash, ws_sub_payload } => {
+                    println!("🟢 [HOT PATH] Dynamic WS Subscription: YES={} NO={}", yes_hash, no_hash);
+                    
+                    // Update bi-directional map
+                    token_pairs.insert(yes_hash, (yes_hash, no_hash));
+                    token_pairs.insert(no_hash, (yes_hash, no_hash));
+                    eval_trackers.insert(yes_hash, EvalTracker::new());
+                    eval_trackers.insert(no_hash, EvalTracker::new());
+                    orderbook.entry(yes_hash).or_insert_with(TokenBookState::new);
+                    orderbook.entry(no_hash).or_insert_with(TokenBookState::new);
+                    
+                    // Send WebSocket subscription (pre-formatted by rollover thread)
+                    let _ = ws_stream.send(ws_sub_payload);
                 }
-                RolloverCommand::RemovePair(hash) => {
-                    println!("[ROLLOVER] Removing mapping: {}", hash);
-                    token_pairs.remove(&hash);
-                    eval_trackers.remove(&hash);
+                RolloverCommand::RemovePair { yes_hash, no_hash, ws_unsub_payload: _ } => {
+                    println!("🔴 [HOT PATH] Removing: YES={} NO={}", yes_hash, no_hash);
+                    token_pairs.remove(&yes_hash);
+                    token_pairs.remove(&no_hash);
+                    eval_trackers.remove(&yes_hash);
+                    eval_trackers.remove(&no_hash);
                 }
             }
         }
