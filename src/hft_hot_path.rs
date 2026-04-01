@@ -292,12 +292,10 @@ pub fn run_sync_hot_path(
                             let combined = yes_ask_price + no_ask_price;
                             let is_dust = combined < MIN_VALID_COMBINED_U64;
                             let _ = log_tx.try_send(LogEvent::EdgeCheck {
-                                yes_hash: yes_hash,
-                                no_hash: no_hash,
-                                yes_ask: yes_ask_price,
-                                no_ask: no_ask_price,
-                                combined: combined,
-                                is_dust: is_dust,
+                                yes_hash,
+                                no_hash,
+                                combined_ask: combined,
+                                dust: is_dust,
                             });
                         }
                         

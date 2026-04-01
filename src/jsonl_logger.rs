@@ -28,118 +28,91 @@ pub enum LogEvent {
         hash: u64,
         end_time: i64,
     },
-    /// Orderbook update
-    Orderbook {
-        hash: u64,
-        price: u64,
-        size: u64,
-        is_bid: bool,
-    },
-    /// Edge check (every 50th evaluation)
+    /// Edge check (for debugging)
     EdgeCheck {
         yes_hash: u64,
         no_hash: u64,
-        yes_ask: u64,
-        no_ask: u64,
-        combined: u64,
-        is_dust: bool,
-    },
-    /// Edge detected (actionable opportunity)
-    EdgeFound {
-        yes_hash: u64,
-        no_hash: u64,
-        yes_ask: u64,
-        no_ask: u64,
-        combined: u64,
-        profit_usd: u64,
-    },
-    /// Sequence tracking
-    Sequence {
-        expected: u64,
-        received: u64,
-        dropped: u64,
+        combined_ask: u64,
+        dust: bool,
     },
 }
 
-/// Logger handle for sending events from hot path
-#[derive(Clone)]
+/// Background logger thread
 pub struct JsonlLogger {
-    tx: Sender<LogEvent>,
+    receiver: Receiver<LogEvent>,
+    writer: BufWriter<File>,
+    buf: Vec<u8>,
 }
 
 impl JsonlLogger {
-    /// Create new logger with bounded channel (capacity: 4096 events)
-    pub fn new() -> Self {
-        let (tx, _rx) = bounded(4096);
-        Self { tx }
+    pub fn new(receiver: Receiver<LogEvent>) -> Self {
+        let file = File::create("/mnt/ramdisk/nohup_v2.jsonl")
+            .expect("Failed to create JSONL file");
+        let writer = BufWriter::new(file);
+        
+        Self {
+            receiver,
+            writer,
+            buf: vec![0u8; 1024], // Pre-allocated buffer (reused)
+        }
     }
     
-    /// Get sender for hot path (clone this, not the whole logger)
-    pub fn sender(&self) -> Sender<LogEvent> {
-        self.tx.clone()
-    }
-    
-    /// Start background logging thread
     pub fn start(log_rx: Receiver<LogEvent>) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
-            run_logger_thread(log_rx);
+            let mut logger = JsonlLogger::new(log_rx);
+            logger.run();
         })
     }
-}
-
-/// Background thread: formats JSONL using itoa (zero-allocation)
-fn run_logger_thread(log_rx: Receiver<LogEvent>) {
-    let file = File::create("/mnt/ramdisk/nohup_v2.jsonl")
-        .expect("Failed to create JSONL log file");
-    let mut writer = BufWriter::with_capacity(65536, file);
-    let mut buf = [0u8; 256]; // Pre-allocated stack buffer
     
-    while let Ok(event) = log_rx.recv() {
-        let mut cursor = std::io::Cursor::new(&mut buf[..]);
+    fn run(&mut self) {
+        eprintln!("✅ [LOGGER] Thread started");
         
-        match event {
-            LogEvent::Metric { uptime, msgs, evals, edges, evals_sec, pairs, dropped, valid_evals, missing_data } => {
-                write!(&mut cursor, 
-                    "{{\"t\":\"m\",\"up\":{},\"msg\":{},\"ev\":{},\"ed\":{},\"rps\":{},\"pr\":{},\"dr\":{}}}\n",
-                    uptime, msgs, evals, edges, evals_sec, pairs, dropped
-                ).unwrap();
-            },
-            LogEvent::Rollover { action, hash, end_time } => {
-                let action_str = if action == 0 { "add" } else { "rem" };
-                write!(&mut cursor,
-                    "{{\"t\":\"r\",\"act\":\"{}\",\"h\":{},\"end\":{}}}\n",
-                    action_str, hash, end_time
-                ).unwrap();
-            },
-            LogEvent::Orderbook { hash, price, size, is_bid } => {
-                let side = if is_bid { "b" } else { "a" };
-                write!(&mut cursor,
-                    "{{\"t\":\"b\",\"h\":{},\"p\":{},\"s\":{},\"side\":\"{}\"}}\n",
-                    hash, price, size, side
-                ).unwrap();
-            },
-            LogEvent::EdgeCheck { yes_hash, no_hash, yes_ask, no_ask, combined, is_dust } => {
-                write!(&mut cursor,
-                    "{{\"t\":\"ec\",\"yh\":{},\"nh\":{},\"ya\":{},\"na\":{},\"sum\":{},\"dust\":{}}}\n",
-                    yes_hash, no_hash, yes_ask, no_ask, combined, is_dust
-                ).unwrap();
-            },
-            LogEvent::EdgeFound { yes_hash, no_hash, yes_ask, no_ask, combined, profit_usd } => {
-                write!(&mut cursor,
-                    "{{\"t\":\"e\",\"yh\":{},\"nh\":{},\"ya\":{},\"na\":{},\"sum\":{},\"prof\":{}}}\n",
-                    yes_hash, no_hash, yes_ask, no_ask, combined, profit_usd
-                ).unwrap();
-            },
-            LogEvent::Sequence { expected, received, dropped } => {
-                write!(&mut cursor,
-                    "{{\"t\":\"s\",\"exp\":{},\"recv\":{},\"drop\":{}}}\n",
-                    expected, received, dropped
-                ).unwrap();
-            },
+        while let Ok(event) = self.receiver.recv() {
+            // Format event into buffer
+            let json_len = self.format_event(event);
+            
+            // Write to file with error handling (no unwrap!)
+            if let Err(e) = self.writer.write_all(&self.buf[..json_len]) {
+                eprintln!("🚨 [LOGGER] Disk I/O error (RAM disk full?): {}", e);
+                // Don't exit - survive transient errors
+            }
+            
+            // Safe flush - ignore errors
+            let _ = self.writer.flush();
         }
         
-        let pos = cursor.position() as usize;
-        writer.write_all(&buf[..pos]).unwrap();
-        writer.flush().unwrap();  // Flush after each event for real-time logging
+        eprintln!("🚨 [LOGGER] Channel disconnected. Thread shutting down.");
+    }
+    
+    fn format_event(&mut self, event: LogEvent) -> usize {
+        use std::io::Write;
+        
+        let mut cursor = std::io::Cursor::new(&mut self.buf[..]);
+        
+        let result = match event {
+            LogEvent::Metric { uptime, msgs, evals, edges, evals_sec, pairs, dropped, valid_evals: _, missing_data: _ } => {
+                write!(cursor, 
+                    "{{\"t\":\"m\",\"up\":{},\"msg\":{},\"ev\":{},\"ed\":{},\"rps\":{},\"pr\":{},\"dr\":{}}}\n",
+                    uptime, msgs, evals, edges, evals_sec, pairs, dropped)
+            }
+            LogEvent::Rollover { action, hash, end_time } => {
+                let action_str = if action == 0 { "add" } else { "remove" };
+                write!(cursor, 
+                    "{{\"t\":\"r\",\"a\":\"{}\",\"h\":{},\"e\":{}}}\n",
+                    action_str, hash, end_time)
+            }
+            LogEvent::EdgeCheck { yes_hash, no_hash, combined_ask, dust } => {
+                write!(cursor,
+                    "{{\"t\":\"ec\",\"yh\":{},\"nh\":{},\"ya\":{},\"na\":{},\"sum\":{},\"dust\":{}}}\n",
+                    yes_hash, no_hash, combined_ask / 2, combined_ask / 2, combined_ask, dust)
+            }
+        };
+        
+        if let Err(e) = result {
+            eprintln!("🚨 [LOGGER] Format error: {}", e);
+            return 0;
+        }
+        
+        cursor.position() as usize
     }
 }

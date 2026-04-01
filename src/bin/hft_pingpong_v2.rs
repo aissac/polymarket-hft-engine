@@ -206,32 +206,54 @@ fn main() {
     pingpong::hft_metrics::start_heartbeat_thread();
 
     // ============================================================
-    // 9. RUN HOT PATH WITH ROLLOVER CHANNEL
+    // 9. AUTO-RECONNECT LOOP (NotebookLM Step 1)
     // ============================================================
-    println!("🔥 Starting hot path (memchr parser, target: <1µs)...");
-    println!("🔄 Rollover channel active - markets will transition seamlessly");
+    println!("🔄 Auto-reconnect enabled (5s delay, 30s TCP timeout)");
     
-    let ws_stream = connect_to_polymarket(all_tokens.clone());
-    // Convert token_pairs to bi-directional map
-    let mut bidi_pairs: std::collections::HashMap<u64, (u64, u64)> = std::collections::HashMap::new();
-    for (&yes_hash, &no_hash) in complement_map.iter() {
-        bidi_pairs.insert(yes_hash, (yes_hash, no_hash));
-        bidi_pairs.insert(no_hash, (yes_hash, no_hash));
+    let mut reconnect_count: u64 = 0;
+    
+    loop {
+        // Wait before reconnecting (skip on first iteration)
+        if reconnect_count > 0 {
+            let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            println!("🔄 [{}] Reconnect attempt #{} in 5 seconds...", timestamp, reconnect_count);
+            std::thread::sleep(Duration::from_secs(5));
+        }
+        reconnect_count += 1;
+        
+        // Build bi-directional map (needed for each reconnect)
+        let mut bidi_pairs: std::collections::HashMap<u64, (u64, u64)> = std::collections::HashMap::new();
+        for (&yes_hash, &no_hash) in complement_map.iter() {
+            bidi_pairs.insert(yes_hash, (yes_hash, no_hash));
+            bidi_pairs.insert(no_hash, (yes_hash, no_hash));
+        }
+        
+        println!("🔥 Starting hot path (memchr parser, target: <1µs)...");
+        println!("🔄 Rollover channel active - markets will transition seamlessly");
+        println!("🔗 [NETWORK] Establishing TCP Connection (attempt #{})...", reconnect_count);
+        
+        // Connect to WebSocket (this now has 30s TCP timeout built-in)
+        let ws_stream = connect_to_polymarket(all_tokens.clone());
+        
+        println!("✅ [NETWORK] WebSocket connected");
+        
+        // Run hot path - blocks until TCP timeout (30s) or error
+        run_sync_hot_path(
+            ws_stream,
+            opportunity_tx.clone(),
+            all_tokens.clone(),
+            killswitch_hot.clone(),
+            bidi_pairs,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            rollover_rx.clone(),
+            log_tx.clone(),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        );
+        
+        // Hot path exited - connection lost, will reconnect
+        let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        println!("⚠️ [{}] Hot path exited - connection lost", timestamp);
+        println!("🔄 Will reconnect in 5 seconds...");
     }
-    println!("Built bi-directional map: {} mappings", bidi_pairs.len());
-    
-    run_sync_hot_path(
-        ws_stream,
-        opportunity_tx,
-        all_tokens,
-        killswitch_hot,
-        bidi_pairs,
-        Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        rollover_rx,
-        log_tx.clone(),
-        Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        Arc::new(std::sync::atomic::AtomicU64::new(0)),
-    );
-    
-    println!("🛑 Hot path exited");
 }
