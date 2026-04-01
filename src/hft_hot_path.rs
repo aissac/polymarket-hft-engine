@@ -184,6 +184,8 @@ pub fn run_sync_hot_path(
 
     let mut messages = 0u64;
     let mut total_evals = 0u64;
+    let mut last_ping = Instant::now();
+    const PING_INTERVAL: Duration = Duration::from_secs(20);
     let mut edges_found = 0u64;
     let start = Instant::now();
     let mut last_report = Instant::now();
@@ -224,7 +226,20 @@ pub fn run_sync_hot_path(
             }
         }
 
-        let msg = match ws_stream.socket.read() {
+        // Send ping every 20 seconds to keep connection alive
+            // Send ping every 20 seconds to keep connection alive
+            if last_ping.elapsed() >= PING_INTERVAL {
+                if let Err(e) = ws_stream.socket.send(Message::Ping(vec![])) {
+                    eprintln!("Ping failed: {}", e);
+                }
+                last_ping = Instant::now();
+            }
+            
+            let msg = match ws_stream.socket.read() {
+            Ok(Message::Pong(_)) => {
+                // Server responded to our ping - connection alive
+                continue;
+            }
             Ok(m) => m,
             
             // 30-second TCP timeout catcher (NotebookLM recommendation)
