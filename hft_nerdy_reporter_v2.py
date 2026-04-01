@@ -90,7 +90,7 @@ def calculate_rates(metrics, prev_state):
         rates['evals_per_sec_avg'] = (metrics['total_evals'] - prev_state.get('total_evals', 0)) / time_delta
         rates['edges_per_min'] = (metrics['total_edges'] - prev_state.get('total_edges', 0)) / (time_delta / 60)
     else:
-        rates['msgs_per_sec'] = metrics['evals_per_sec']
+        rates['msgs_per_sec'] = metrics['evals_per_sec']  # Will be updated from JSONL
         rates['evals_per_sec_avg'] = metrics['evals_per_sec']
         rates['edges_per_min'] = 0
     
@@ -128,7 +128,7 @@ Dropped Packets: {metrics['dropped_packets']:,}
 THROUGHPUT (10-min avg)
 ==============================
 
-Msg Rate: {rates.get('msgs_per_sec', 0):.1f} msg/sec
+WS Msg Rate: {rates.get('msgs_per_sec', 0):.1f} msg/sec
 Eval Rate: {rates.get('evals_per_sec_avg', 0):.1f} eval/sec
 Edge Rate: {rates.get('edges_per_min', 0):.4f} edges/min
 Pairs Tracked: {metrics['pairs_tracked']}

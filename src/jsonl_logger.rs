@@ -98,7 +98,7 @@ fn run_logger_thread(log_rx: Receiver<LogEvent>) {
         let mut cursor = std::io::Cursor::new(&mut buf[..]);
         
         match event {
-            LogEvent::Metric { uptime, msgs, evals, edges, evals_sec, pairs, dropped } => {
+            LogEvent::Metric { uptime, msgs, evals, edges, evals_sec, pairs, dropped, valid_evals, missing_data } => {
                 write!(&mut cursor, 
                     "{{\"t\":\"m\",\"up\":{},\"msg\":{},\"ev\":{},\"ed\":{},\"rps\":{},\"pr\":{},\"dr\":{}}}\n",
                     uptime, msgs, evals, edges, evals_sec, pairs, dropped

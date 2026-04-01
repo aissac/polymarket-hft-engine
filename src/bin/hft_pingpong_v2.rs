@@ -229,6 +229,8 @@ fn main() {
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
         rollover_rx,
         log_tx.clone(),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
     );
     
     println!("🛑 Hot path exited");

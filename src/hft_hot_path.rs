@@ -212,7 +212,7 @@ pub fn run_sync_hot_path(
                     orderbook.entry(no_hash).or_insert_with(TokenBookState::new);
                     
                     // Send WebSocket subscription (pre-formatted by rollover thread)
-                    let _ = ws_stream.send(ws_sub_payload);
+                    let _ = ws_stream.send(tungstenite::Message::Text(ws_sub_payload));
                 }
                 RolloverCommand::RemovePair { yes_hash, no_hash, ws_unsub_payload: _ } => {
                     println!("🔴 [HOT PATH] Removing: YES={} NO={}", yes_hash, no_hash);
@@ -226,10 +226,17 @@ pub fn run_sync_hot_path(
 
         let msg = match ws_stream.socket.read() {
             Ok(m) => m,
+            
+            // 30-second TCP timeout catcher (NotebookLM recommendation)
+            Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                eprintln!("[TCP TIMEOUT] 30s of silence. Connection dead! Reconnecting...");
+                break; // Break hot path loop, let caller reconnect
+            },
+            
+            // Standard disconnects
             Err(e) => {
-                eprintln!("🚨 WebSocket read error: {}", e);
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
+                eprintln!("WebSocket read error: {}", e);
+                break;
             }
         };
 
@@ -343,6 +350,8 @@ pub fn run_sync_hot_path(
                 evals_sec: evals_this_sec as u64,
                 pairs: token_pairs.len() as u64,
                 dropped: 0,
+                valid_evals: 0,
+                missing_data: 0,
             });
             last_eval_count = total_evals;
             last_report = Instant::now();

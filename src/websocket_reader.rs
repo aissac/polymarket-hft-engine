@@ -2,18 +2,33 @@
 //! Uses sync tungstenite for sub-microsecond latency (no tokio)
 
 use std::io::Read;
-use tungstenite::{connect, Message};
+use tungstenite::{Message, client_tls};
 use std::net::TcpStream;
+use std::time::Duration;
 use tungstenite::stream::MaybeTlsStream;
 
 /// Connect to Polymarket WebSocket and return a stream for the hot path
 pub fn connect_to_polymarket(tokens: Vec<String>) -> WebSocketReader {
     let url = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
     
-    println!("📡 Connecting to Polymarket WebSocket...");
+    println!("Connecting to Polymarket WebSocket...");
     
-    let (mut socket, _response) = connect(url)
-        .expect("Failed to connect to WebSocket");
+    // OPTION C: Set TCP timeout BEFORE TLS handshake (NotebookLM recommendation)
+    // 1. Manually connect TCP socket to port 443
+    let tcp_stream = TcpStream::connect("ws-subscriptions-clob.polymarket.com:443")
+        .expect("Failed to connect TCP stream");
+    
+    // 2. Set 30-second read timeout BEFORE TLS handshake
+    tcp_stream.set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("Failed to set read timeout");
+    
+    println!("TCP connected with 30s timeout");
+    
+    // 3. Perform TLS/WS handshake with pre-configured stream
+    let (mut socket, _response) = client_tls(url, tcp_stream)
+        .expect("Failed TLS handshake");
+    
+    println!("WebSocket connected");
     
     // Subscribe to all tokens
     let subscribe_msg = serde_json::json!({
@@ -27,7 +42,7 @@ pub fn connect_to_polymarket(tokens: Vec<String>) -> WebSocketReader {
     let msg = Message::Text(subscribe_msg.to_string());
     socket.send(msg).expect("Failed to subscribe");
     
-    println!("📡 Subscribed to {} tokens", tokens.len());
+    println!("Subscribed to {} tokens", tokens.len());
     
     WebSocketReader { socket, buffer: vec![] }
 }
@@ -38,56 +53,28 @@ pub struct WebSocketReader {
     buffer: Vec<u8>,
 }
 
-impl WebSocketReader {
-    /// Send a message over the WebSocket (for rollover subscriptions)
-    pub fn send(&mut self, msg: String) -> std::io::Result<()> {
-        self.socket.send(Message::Text(msg))
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+impl Read for WebSocketReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self.socket.read() {
+            Ok(Message::Text(text)) => {
+                let bytes = text.as_bytes();
+                let len = std::cmp::min(buf.len(), bytes.len());
+                buf[..len].copy_from_slice(&bytes[..len]);
+                Ok(len)
+            }
+            Ok(Message::Binary(data)) => {
+                let len = std::cmp::min(buf.len(), data.len());
+                buf[..len].copy_from_slice(&data[..len]);
+                Ok(len)
+            }
+            Ok(_) => Ok(0),
+            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+        }
     }
 }
 
-impl Read for WebSocketReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        // If we have leftover data from previous message, return it
-        if !self.buffer.is_empty() {
-            let len = std::cmp::min(buf.len(), self.buffer.len());
-            buf[..len].copy_from_slice(&self.buffer[..len]);
-            self.buffer.drain(..len);
-            return Ok(len);
-        }
-        
-        // Read next WebSocket message
-        loop {
-            match self.socket.read() {
-                Ok(Message::Text(text)) => {
-                    let bytes = text.as_bytes();
-                    let len = std::cmp::min(buf.len(), bytes.len());
-                    buf[..len].copy_from_slice(&bytes[..len]);
-                    
-                    // Store remainder for next read
-                    if bytes.len() > len {
-                        self.buffer = bytes[len..].to_vec();
-                    }
-                    
-                    return Ok(len);
-                }
-                Ok(Message::Ping(data)) => {
-                    // Respond to ping automatically
-                    let _ = self.socket.send(Message::Pong(data));
-                    continue;
-                }
-                Ok(Message::Pong(_)) => {
-                    // Ignore pong
-                    continue;
-                }
-                Ok(Message::Close(_)) => {
-                    return Ok(0); // EOF
-                }
-                Err(e) => {
-                    return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
-                }
-                _ => continue,
-            }
-        }
+impl WebSocketReader {
+    pub fn send(&mut self, msg: Message) -> Result<(), tungstenite::Error> {
+        self.socket.send(msg)
     }
 }
