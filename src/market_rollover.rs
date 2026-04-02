@@ -1,197 +1,177 @@
-//! Market Rollover - Dynamic Token Pair Management
-//!
-//! Fetches markets by constructing slugs (same as startup).
-//! Uses clobTokenIds field (JSON string array) to get token IDs.
-//! Sends AddPair/RemovePair commands to hot path via crossbeam_channel.
+//! Market Rollover with Signal Filter - T-65s Check, T-60s Execute
+//! Avoids 60-second liquidity vacuum (MM exodus at T-60s)
 
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use std::collections::HashSet;
-use std::sync::Arc;
-use std::time::Duration;
-use chrono::{Utc, Timelike};
-use serde_json::Value;
+use tokio::time::sleep;
+use tokio::sync::watch;
 use crossbeam_channel::Sender;
-use crate::hft_hot_path::RolloverCommand;
+use serde_json::Value;
 
-/// Hash token ID string to u64 (MUST match hot path fast_hash)
-pub fn hash_token(token_id: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    use std::collections::hash_map::DefaultHasher;
-    let mut hasher = DefaultHasher::new();
-    token_id.as_bytes().hash(&mut hasher);
-    hasher.finish()
-}
+use crate::hft_hot_path::RolloverCommandV2;
+use crate::price_cache::PriceCache;
+use crate::signal_filter::SignalFilter;
 
-/// Get CURRENT period timestamps (same as startup)
-fn get_current_periods() -> Vec<(i64, &'static str)> {
-    let now = Utc::now();
-    let mut periods = Vec::new();
+pub async fn run_rollover_thread(
+    price_cache: &PriceCache,
+    ws_tokens_tx: watch::Sender<Vec<String>>,
+    hot_path_tx: Sender<RolloverCommandV2>,
+) {
+    let client = reqwest::Client::new();
+    let signal_filter = SignalFilter::new();
     
-    // 5-minute periods
-    let minute_5 = (now.minute() / 5) * 5;
-    let period_5m = now.with_minute(minute_5).unwrap().with_second(0).unwrap().with_nanosecond(0).unwrap();
-    let ts_5m = period_5m.timestamp();
-    periods.push((ts_5m, "5m"));
-    periods.push((ts_5m + 300, "5m"));  // Next 5m
-    
-    // 15-minute periods
-    let minute_15 = (now.minute() / 15) * 15;
-    let period_15m = now.with_minute(minute_15).unwrap().with_second(0).unwrap().with_nanosecond(0).unwrap();
-    let ts_15m = period_15m.timestamp();
-    periods.push((ts_15m, "15m"));
-    periods.push((ts_15m + 900, "15m"));  // Next 15m
-    
-    // 1-hour periods
-    let period_1h = now.with_minute(0).unwrap().with_second(0).unwrap().with_nanosecond(0).unwrap();
-    let ts_1h = period_1h.timestamp();
-    periods.push((ts_1h, "1h"));
-    periods.push((ts_1h + 3600, "1h"));  // Next 1h
-    
-    periods
-}
+    let mut discovered_slugs: HashSet<String> = HashSet::new();
+    let mut active_ws_tokens: Vec<String> = Vec::new();
 
-/// Fetch tokens for a specific market slug using clobTokenIds
-async fn fetch_market_tokens(client: &reqwest::Client, slug: &str, now: &chrono::DateTime<Utc>) -> Option<(String, String)> {
-    let url = format!("https://gamma-api.polymarket.com/markets?slug={}", slug);
+    println!("🔍 [DISCOVERY] Starting with INITIAL token subscription...");
+
+    // Bootstrap: Subscribe to CURRENT markets immediately
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let current_5m = (now / 300) * 300;
+    let current_15m = (now / 900) * 900;
     
-    match client.get(&url).send().await {
-        Ok(response) => {
-            if !response.status().is_success() {
-                return None;
-            }
-            
-            match response.json::<Value>().await {
-                Ok(json) => {
-                    if let Some(markets) = json.as_array() {
-                        if let Some(market) = markets.first() {
-                            // Check if market is active (started, not expired, not closed)
-                            let active = market.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
-                            let closed = market.get("closed").and_then(|v| v.as_bool()).unwrap_or(true);
-                            
-                            // Parse dates
-                            let start_str = market.get("startDate").and_then(|v| v.as_str()).unwrap_or("");
-                            let end_str = market.get("endDate").and_then(|v| v.as_str()).unwrap_or("");
-                            
-                            let start_time = chrono::DateTime::parse_from_rfc3339(start_str).ok()?.with_timezone(&Utc);
-                            let end_time = chrono::DateTime::parse_from_rfc3339(end_str).ok()?.with_timezone(&Utc);
-                            
-                            // Only add if currently active (started, not expired, not closed)
-                            if !active || closed || now < &start_time || now >= &end_time {
-                                return None;
-                            }
-                            
-                            // Extract from clobTokenIds (JSON string array like startup does)
-                            let clob_ids_str = market.get("clobTokenIds").and_then(|v| v.as_str())?;
-                            let clob_ids: Vec<String> = serde_json::from_str(clob_ids_str).ok()?;
-                            
-                            if clob_ids.len() >= 2 && !clob_ids[0].is_empty() && !clob_ids[1].is_empty() {
-                                println!("[ROLLOVER] Found: {} (clobTokenIds[0] len={})", 
-                                    slug, clob_ids[0].len());
-                                return Some((clob_ids[0].clone(), clob_ids[1].clone()));
-                            }
-                        }
-                    }
-                    None
-                }
-                Err(e) => {
-                    println!("[ROLLOVER] {} JSON error: {}", slug, e);
-                    None
-                }
-            }
+    let assets = vec!["btc", "eth", "sol", "xrp"];
+    for asset in &assets {
+        let slug_5m = format!("{}-updown-5m-{}", asset, current_5m);
+        if let Some((yes, no)) = fetch_market_tokens(&client, &slug_5m).await {
+            println!("📊 [INIT] {} → YES={}, NO={}", slug_5m, &yes[..16], &no[..16]);
+            active_ws_tokens.push(yes);
+            active_ws_tokens.push(no);
+            discovered_slugs.insert(slug_5m);
         }
-        Err(e) => {
-            println!("[ROLLOVER] {} network error: {}", slug, e);
-            None
+        
+        let slug_15m = format!("{}-updown-15m-{}", asset, current_15m);
+        if let Some((yes, no)) = fetch_market_tokens(&client, &slug_15m).await {
+            println!("📊 [INIT] {} → YES={}, NO={}", slug_15m, &yes[..16], &no[..16]);
+            active_ws_tokens.push(yes);
+            active_ws_tokens.push(no);
+            discovered_slugs.insert(slug_15m);
         }
     }
-}
+    
+    println!("🔗 [DISCOVERY] Subscribing to {} initial tokens", active_ws_tokens.len());
+    let _ = ws_tokens_tx.send(active_ws_tokens.clone());
+    println!("✅ [DISCOVERY] Initial subscription complete");
 
-/// Run the rollover monitoring thread
-pub async fn run_rollover_thread(
-    client: Arc<reqwest::Client>,
-    rollover_tx: Sender<RolloverCommand>,
-) {
-    println!("🔄 [ROLLOVER] Thread started - monitoring for active markets");
-    
-    let mut tracked_markets: HashSet<String> = HashSet::new();
-    
+    // Main loop
     loop {
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let next_5m = (now / 300) * 300 + 300;
+        let next_15m = (now / 900) * 900 + 900;
         
-        let now = Utc::now();
-        let periods = get_current_periods();
-        let assets = ["btc", "eth", "sol", "xrp"];
-        
-        let mut active_this_cycle: HashSet<String> = HashSet::new();
-        let mut found_count = 0;
+        let mut new_markets_found = false;
         
         for asset in &assets {
-            for (period_ts, timeframe) in &periods {
-                let slug = match *timeframe {
-                    "5m" => format!("{}-updown-5m-{}", asset, period_ts - 600),
-                    "15m" => format!("{}-updown-15m-{}", asset, period_ts),
-                    "1h" => format!("{}-updown-1h-{}", asset, period_ts),
-                    _ => continue,
-                };
-                
-                match fetch_market_tokens(&client, &slug, &now).await {
-                    Some((yes_token, no_token)) => {
-                        found_count += 1;
-                        let market_id = yes_token.clone();
-                        active_this_cycle.insert(market_id.clone());
-                        
-                        if !tracked_markets.contains(&market_id) {
-                            println!("🟢 [ROLLOVER] Adding: {} ({} {})", slug, asset, timeframe);
-                            
-                            let yes_hash = hash_token(&yes_token);
-                            let no_hash = hash_token(&no_token);
-                            
-                            // Pre-format WebSocket subscription payload (zero-allocation for hot path)
-                            let ws_sub_payload = format!(
-                                r#"{{"token_ids": ["{}", "{}"], "type": "price_changes"}}"#,
-                                yes_token, no_token
-                            );
-                            
-                            if let Err(e) = rollover_tx.send(RolloverCommand::AddPair {
-                                yes_hash,
-                                no_hash,
-                                ws_sub_payload,
-                            }) {
-                                eprintln!("🚨 [ROLLOVER] Channel disconnected: {}", e);
-                                return;
+            // 5m: Check at T-65s, execute at T-60s
+            let time_to_5m = next_5m - now;
+            if time_to_5m <= 65 && time_to_5m > 55 {
+                let next_slug = format!("{}-updown-5m-{}", asset, next_5m);
+                if !discovered_slugs.contains(&next_slug) {
+                    let current_slug = format!("{}-updown-5m-{}", asset, (now / 300) * 300);
+                    if let Some((cur_yes, cur_no)) = fetch_market_tokens(&client, &current_slug).await {
+                        // T-65s: Check signal BEFORE MM exodus
+                        if signal_filter.is_market_ranging(price_cache, &cur_yes, &cur_no) {
+                            println!("✅ [SIGNAL @ T-65s] {} RANGING - will place trap at T-60s", asset);
+                            // Sleep remaining time to hit T-60s exactly
+                            let trigger_time = next_5m.saturating_sub(60);
+                            let sleep_time = trigger_time.saturating_sub(now);
+                            if sleep_time > 0 {
+                                sleep(Duration::from_secs(sleep_time)).await;
                             }
-                            
-                            tracked_markets.insert(market_id.clone());
-                            println!("[ROLLOVER] Now tracking {} markets", tracked_markets.len());
+                            place_trap(&client, &next_slug, next_5m, &hot_path_tx, &mut active_ws_tokens, &mut discovered_slugs).await;
+                            new_markets_found = true;
+                        } else {
+                            println!("⚠️ [SIGNAL @ T-65s] {} TRENDING - SKIP next 5m", asset);
+                            discovered_slugs.insert(next_slug);
                         }
                     }
-                    None => {
-                        // Market doesn't exist, not active, or expired
+                }
+            }
+            
+            // 15m: Same logic
+            let time_to_15m = next_15m - now;
+            if time_to_15m <= 65 && time_to_15m > 55 {
+                let next_slug = format!("{}-updown-15m-{}", asset, next_15m);
+                if !discovered_slugs.contains(&next_slug) {
+                    let current_slug = format!("{}-updown-15m-{}", asset, (now / 900) * 900);
+                    if let Some((cur_yes, cur_no)) = fetch_market_tokens(&client, &current_slug).await {
+                        if signal_filter.is_market_ranging(price_cache, &cur_yes, &cur_no) {
+                            println!("✅ [SIGNAL @ T-65s] {} 15m RANGING - will place trap at T-60s", asset);
+                            let trigger_time = next_15m.saturating_sub(60);
+                            let sleep_time = trigger_time.saturating_sub(now);
+                            if sleep_time > 0 {
+                                sleep(Duration::from_secs(sleep_time)).await;
+                            }
+                            place_trap(&client, &next_slug, next_15m, &hot_path_tx, &mut active_ws_tokens, &mut discovered_slugs).await;
+                            new_markets_found = true;
+                        } else {
+                            println!("⚠️ [SIGNAL @ T-65s] {} 15m TRENDING - SKIP next 15m", asset);
+                            discovered_slugs.insert(next_slug);
+                        }
                     }
                 }
             }
         }
         
-        println!("[ROLLOVER] Checked {} slugs, found {} active markets, tracking {}", 
-            assets.len() * periods.len(), found_count, tracked_markets.len());
-        
-        // Remove expired markets
-        let expired: Vec<String> = tracked_markets
-            .iter()
-            .filter(|id| !active_this_cycle.contains(*id))
-            .cloned()
-            .collect();
-        
-        for expired_id in expired {
-            println!("🔴 [ROLLOVER] Removing expired: {}", expired_id);
-            
-            let expired_hash = hash_token(&expired_id);
-            
-            let _ = rollover_tx.send(RolloverCommand::RemovePair {
-                                yes_hash: expired_hash,
-                                no_hash: 0,  // Not used for removal
-                                ws_unsub_payload: String::new(),  // Not sending unsub
-                            });
-            tracked_markets.remove(&expired_id);
+        if new_markets_found {
+            println!("🔗 [DISCOVERY] Total tracked: {} tokens", active_ws_tokens.len());
+            let _ = ws_tokens_tx.send(active_ws_tokens.clone());
         }
+        
+        // Cleanup expired
+        discovered_slugs.retain(|s| {
+            let parts: Vec<&str> = s.split("-").collect();
+            if let Some(ts_str) = parts.last() {
+                if let Ok(ts) = ts_str.parse::<u64>() {
+                    return ts > now;
+                }
+            }
+            false
+        });
+        
+        sleep(Duration::from_secs(10)).await;
     }
+}
+
+async fn fetch_market_tokens(client: &reqwest::Client, slug: &str) -> Option<(String, String)> {
+    let url = format!("https://gamma-api.polymarket.com/markets?slug={}", slug);
+    match tokio::time::timeout(Duration::from_secs(5), client.get(&url).send()).await {
+        Ok(Ok(resp)) => {
+            if let Ok(json) = resp.json::<Vec<Value>>().await {
+                if let Some(market) = json.first() {
+                    if let Ok(tokens) = serde_json::from_str::<Vec<String>>(market["clobTokenIds"].as_str()?) {
+                        if tokens.len() >= 2 {
+                            return Some((tokens[0].clone(), tokens[1].clone()));
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+async fn place_trap(
+    client: &reqwest::Client,
+    slug: &str,
+    end_time: u64,
+    hot_path_tx: &Sender<RolloverCommandV2>,
+    active_ws_tokens: &mut Vec<String>,
+    discovered_slugs: &mut HashSet<String>,
+) {
+    if let Some((yes, no)) = fetch_market_tokens(client, slug).await {
+        println!("✅ [TRAP PLACED @ T-60s] {}", slug);
+        println!("   YES: {} | NO: {} | Ends: {}", &yes[..16], &no[..16], end_time);
+        discovered_slugs.insert(slug.to_string());
+        active_ws_tokens.push(yes.clone());
+        active_ws_tokens.push(no.clone());
+        let _ = hot_path_tx.send(RolloverCommandV2::AddPair { yes_token: yes, no_token: no, end_time });
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum RolloverCommandV2 {
+    AddPair { yes_token: String, no_token: String, end_time: u64 },
+    RemovePair { yes_token: String, no_token: String },
 }
