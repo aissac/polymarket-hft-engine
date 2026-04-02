@@ -90,3 +90,15 @@ mod tests {
 }
 pub mod hft_metrics;
 pub mod jsonl_logger;
+pub mod sdk_websocket;
+pub use sdk_websocket::OrderbookSnapshot;
+pub mod pre_order_merge;
+pub mod maker_execution;
+pub use hft_hot_path::RolloverCommandV2;
+pub use market_rollover::run_rollover_thread;
+pub mod one_sided_fill;
+pub mod laddering;
+pub mod signal_filter;
+pub mod price_cache;
+pub use price_cache::{PriceCache, create_price_cache, update_price, get_price, is_market_ranging};
+pub mod toxic_flow;
